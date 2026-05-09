@@ -224,7 +224,14 @@ final class DefaultNapServer implements NapServer {
 
     private String decodeNpub(String npub) {
         try {
-            if (npub == null || !npub.startsWith("npub1")) {
+            if (npub == null || npub.isBlank()) {
+                return null;
+            }
+            // Accept raw hex pubkey (64-char hex string) in addition to bech32 npub
+            if (!npub.startsWith("npub1")) {
+                if (npub.length() == 64 && npub.matches("[0-9a-fA-F]+")) {
+                    return npub.toLowerCase();
+                }
                 return null;
             }
             String hex = nostr.crypto.bech32.Bech32.fromBech32(npub);
