@@ -50,7 +50,10 @@ class NapSessionFilterTest {
         MockHttpServletResponse response = denyAndCapture();
 
         assertThat(response.getStatus()).isEqualTo(403);
-        verify(sessionStore).revokeBySessionId(eq(session.sessionId()), anyLong());
+        // Every session the principal holds, not just the one that happened to make this
+        // request: a suspension the ACL states affirmatively is about the principal.
+        verify(sessionStore).revokeByPrincipal(eq(session.principalPubkey()), anyLong());
+        verify(sessionStore, never()).revokeBySessionId(any(), anyLong());
     }
 
     @Test
@@ -66,6 +69,7 @@ class NapSessionFilterTest {
         MockHttpServletResponse response = denyAndCapture();
 
         assertThat(response.getStatus()).isEqualTo(403);
+        verify(sessionStore, never()).revokeByPrincipal(any(), anyLong());
         verify(sessionStore, never()).revokeBySessionId(any(), anyLong());
     }
 

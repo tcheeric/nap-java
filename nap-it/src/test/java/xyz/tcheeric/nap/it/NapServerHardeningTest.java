@@ -117,6 +117,42 @@ class NapServerHardeningTest {
         assertThat(failureCode(afterBudget)).isEqualTo(NapErrorCode.NAP_COMPLETE_FAILED_TERMINAL);
     }
 
+    @Test
+    void aStrangerCannotSpendAnotherPrincipalsFailureBudget() {
+        // Anyone who learns a challenge_id can sign a well-formed proof with their own key.
+        // If that counted against the budget, knowing the id would be enough to kill a
+        // stranger's login — so the principal check comes first and does not spend it.
+        NapServer server = NapServer.create(options().maxFailuresPerChallenge(2).build());
+        AuthInitResponse issued = issue(server);
+
+        byte[] strangerKey = newPrivateKey();
+        String strangerPrivHex = HEX.formatHex(strangerKey);
+        String strangerPubHex = HEX.formatHex(schnorrPubKey(strangerKey));
+
+        for (int attempt = 1; attempt <= 5; attempt++) {
+            byte[] rawBody = ("{\"challenge_id\":\"" + issued.challengeId() + "\"}")
+                    .getBytes(StandardCharsets.UTF_8);
+            String header = new NapProofBuilder()
+                    .privateKey(strangerPrivHex)
+                    .pubkey(strangerPubHex)
+                    .url(AUTH_URL)
+                    .method("POST")
+                    .challenge("guess-" + attempt)
+                    .challengeId(issued.challengeId())
+                    .body(rawBody)
+                    .createdAt(now)
+                    .buildAuthorizationHeader();
+
+            var outcome = server.verifyCompletion(new VerifyCompletionInput(
+                    header, "POST", AUTH_URL, rawBody, null));
+            assertThat(failureCode(outcome)).isEqualTo(NapErrorCode.NAP_COMPLETE_PRINCIPAL_MISMATCH);
+        }
+
+        // The challenge is untouched: its owner still logs in.
+        var owner = complete(server, issued.challengeId(), issued.challenge(), false);
+        assertThat(owner).isInstanceOf(VerifyCompletionOutcome.Success.class);
+    }
+
     // ------------------------------------------------------------ 429 / caps
 
     @Test
@@ -175,8 +211,81 @@ class NapServerHardeningTest {
 
     // ------------------------------------------------------------- fixtures
 
+    @Test
+    void theOutstandingCapIsScopedToTheCallerAddress() {
+        // /auth/init is unauthenticated and npubs are public. A cap counting one npub across
+        // every address would let anyone fill a stranger's slots and lock them out of logging
+        // in, which is a worse failure than the storage the cap is there to bound.
+        NapServer server = NapServer.create(options()
+                .maxOutstandingChallengesPerNpub(2)
+                .rateLimiter(null)
+                .build());
+
+        assertThat(server.issueChallenge(initInputFrom("198.51.100.1")).isSuccess()).isTrue();
+        assertThat(server.issueChallenge(initInputFrom("198.51.100.1")).isSuccess()).isTrue();
+        var exhausted = (IssueChallengeResult.Failure) server.issueChallenge(initInputFrom("198.51.100.1"));
+        assertThat(exhausted.code()).isEqualTo(NapErrorCode.NAP_INIT_RATE_LIMITED);
+        // Retry-After, so a caller that legitimately hit the cap knows when a slot frees up.
+        assertThat(exhausted.retryAfterSeconds()).isEqualTo(60);
+
+        // Same npub, different address: unaffected.
+        assertThat(server.issueChallenge(initInputFrom("203.0.113.9")).isSuccess()).isTrue();
+    }
+
+    @Test
+    void oneCompletionSpendsTheCallerAddressBudgetOnce() {
+        // /auth/complete checks the limiter twice — once on the address before the proof, once
+        // on the proved pubkey after it. Carrying the address into the second key would charge
+        // it twice and halve the configured rate, unevenly: a request rejected before the proof
+        // would cost one and a request that got through would cost two.
+        NapServer server = NapServer.create(options()
+                .rateLimiter(InMemoryRateLimiter.create(60, 2, clock))
+                .build());
+
+        AuthInitResponse first = issue(server);
+        AuthInitResponse second = issue(server);
+
+        assertThat(complete(server, first.challengeId(), first.challenge(), false))
+                .isInstanceOf(VerifyCompletionOutcome.Success.class);
+        assertThat(complete(server, second.challengeId(), second.challenge(), false))
+                .isInstanceOf(VerifyCompletionOutcome.Success.class);
+    }
+
+    @Test
+    void aRateLimitedResponseIsNotPadded() {
+        // A 429 is already distinguishable by its status code, so padding it hides nothing. It
+        // would only hand a caller who is already over the limit a free hold on a request
+        // thread for the floor's duration — the amplification the limiter exists to prevent.
+        NapServer limited = NapServer.create(options()
+                .minAuthResponseMillis(300)
+                .responseJitterMillis(0)
+                .rateLimiter(key -> RateLimitDecision.denied(7))
+                .build());
+
+        long startedAt = System.nanoTime();
+        limited.issueChallenge(initInput());
+        long deniedMillis = (System.nanoTime() - startedAt) / 1_000_000L;
+        assertThat(deniedMillis).isLessThan(150);
+
+        // Control: an ordinary refusal is still held to the floor, which is what makes the
+        // 401 paths indistinguishable from each other.
+        NapServer padded = NapServer.create(options()
+                .minAuthResponseMillis(300)
+                .responseJitterMillis(0)
+                .build());
+
+        startedAt = System.nanoTime();
+        padded.issueChallenge(new IssueChallengeInput("not-an-npub", AUTH_URL, "POST", "203.0.113.7"));
+        long refusedMillis = (System.nanoTime() - startedAt) / 1_000_000L;
+        assertThat(refusedMillis).isGreaterThanOrEqualTo(300);
+    }
+
     private IssueChallengeInput initInput() {
-        return new IssueChallengeInput(npub, AUTH_URL, "POST", "203.0.113.7");
+        return initInputFrom("203.0.113.7");
+    }
+
+    private IssueChallengeInput initInputFrom(String clientIp) {
+        return new IssueChallengeInput(npub, AUTH_URL, "POST", clientIp);
     }
 
     private AuthInitResponse issue(NapServer server) {

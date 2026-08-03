@@ -15,9 +15,11 @@ import java.util.concurrent.atomic.AtomicLong;
  * configured one multiplied by the instance count. Multi-instance deployments want a shared
  * backend behind the same {@link RateLimiter} interface.
  *
- * <p>The {@code npub}, {@code pubkey} and {@code clientIp} dimensions are counted separately and
- * all of them — one principal cycling addresses is still capped, and so is one address cycling
- * principals.
+ * <p>The {@code pubkey} and {@code clientIp} dimensions are counted separately and all of them —
+ * one proved principal cycling addresses is still capped, and so is one address cycling
+ * principals. The {@code npub} dimension is counted per address instead of globally, because on
+ * {@code /auth/init} it is an unproved, public identifier: a global budget for it locks the owner
+ * out rather than bounding an attacker, who would simply pick another npub.
  */
 public final class InMemoryRateLimiter implements RateLimiter {
 
@@ -51,7 +53,14 @@ public final class InMemoryRateLimiter implements RateLimiter {
 
         List<String> identifiers = new ArrayList<>(3);
         if (key.npub() != null) {
-            identifiers.add(key.scope() + ":npub:" + key.npub());
+            // Scoped to the address when there is one. The npub on /auth/init is unproved and
+            // public, so a budget counting one npub across all addresses is an account-lockout
+            // primitive — spend a stranger's thirty requests and they cannot log in. It also
+            // caps nothing an attacker cannot sidestep by generating another npub, which costs
+            // them nothing. The address dimension below is what actually bounds a flood.
+            identifiers.add(key.clientIp() != null
+                    ? key.scope() + ":npub:" + key.npub() + "@" + key.clientIp()
+                    : key.scope() + ":npub:" + key.npub());
         }
         if (key.pubkey() != null) {
             identifiers.add(key.scope() + ":pubkey:" + key.pubkey());

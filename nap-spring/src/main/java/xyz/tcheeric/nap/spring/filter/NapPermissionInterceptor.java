@@ -50,8 +50,7 @@ public class NapPermissionInterceptor implements HandlerInterceptor {
 
         RequiresPermission permissionAnnotation = findAnnotation(handlerMethod);
         RequiresRole roleAnnotation = findRoleAnnotation(handlerMethod);
-        RequiresStepUp stepUpAnnotation = AnnotatedElementUtils.findMergedAnnotation(
-                handlerMethod.getMethod(), RequiresStepUp.class);
+        RequiresStepUp stepUpAnnotation = findStepUpAnnotation(handlerMethod);
         if (permissionAnnotation == null && roleAnnotation == null && stepUpAnnotation == null) {
             return true;
         }
@@ -122,6 +121,17 @@ public class NapPermissionInterceptor implements HandlerInterceptor {
         return MessageDigest.isEqual(
                 session.stepUpToken().getBytes(StandardCharsets.UTF_8),
                 provided.getBytes(StandardCharsets.UTF_8));
+    }
+
+    /** Method then class, like the other two — a guard declared on the controller must bind. */
+    private RequiresStepUp findStepUpAnnotation(HandlerMethod handlerMethod) {
+        RequiresStepUp methodAnnotation = AnnotatedElementUtils.findMergedAnnotation(
+                handlerMethod.getMethod(), RequiresStepUp.class);
+        if (methodAnnotation != null) {
+            return methodAnnotation;
+        }
+        return AnnotatedElementUtils.findMergedAnnotation(
+                handlerMethod.getBeanType(), RequiresStepUp.class);
     }
 
     private RequiresRole findRoleAnnotation(HandlerMethod handlerMethod) {
