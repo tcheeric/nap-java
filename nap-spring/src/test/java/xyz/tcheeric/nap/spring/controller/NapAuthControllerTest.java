@@ -50,6 +50,15 @@ class NapAuthControllerTest {
             60,     // maxClockSkewSeconds
             600,    // stepUpTtlSeconds
             300,    // aclRefreshIntervalSeconds
+            null,   // rateLimitEnabled — compact ctor defaults these
+            0,      // rateLimitWindowSeconds
+            0,      // rateLimitMaxPerWindow
+            null,   // maxOutstandingChallengesPerNpub
+            null,   // maxOutstandingChallengesPerIp
+            null,   // maxFailuresPerChallenge
+            null,   // minAuthResponseMillis
+            null,   // responseJitterMillis
+            0,      // maxBodyBytes
             List.of("/internal/v1/merchants"),
             new NapProperties.CookieProperties("merchant_session", true, true, "Lax", "/", "", 43200)
     );
@@ -82,7 +91,7 @@ class NapAuthControllerTest {
                 session.roles(), session.permissions()
         ));
 
-        Object body = controller().complete(false, request, response).getBody();
+        Object body = controller().complete(request, response).getBody();
 
         var captor = forClass(VerifyCompletionInput.class);
         verify(napServer).verifyCompletion(captor.capture());
@@ -104,7 +113,7 @@ class NapAuthControllerTest {
         when(napServer.issueChallenge(any(IssueChallengeInput.class)))
                 .thenReturn(new IssueChallengeResult.Success(initResponse));
 
-        ResponseEntity<?> response = controller().init(Map.of("npub", "npub1testpubkey"));
+        ResponseEntity<?> response = controller().init(Map.of("npub", "npub1testpubkey"), new MockHttpServletRequest());
 
         assertThat(response.getStatusCode().value()).isEqualTo(200);
         assertThat(response.getBody()).isNotNull();
@@ -112,7 +121,7 @@ class NapAuthControllerTest {
 
     @Test
     void init_missingNpubAndPubkey_returnsBadRequest() {
-        ResponseEntity<?> response = controller().init(Map.of());
+        ResponseEntity<?> response = controller().init(Map.of(), new MockHttpServletRequest());
         assertThat(response.getStatusCode().value()).isEqualTo(400);
     }
 
@@ -124,7 +133,7 @@ class NapAuthControllerTest {
         request.setAttribute(NapServletFilter.RAW_BODY_ATTRIBUTE, "{}".getBytes());
         MockHttpServletResponse servletResponse = new MockHttpServletResponse();
 
-        ResponseEntity<?> response = controller().complete(false, request, servletResponse);
+        ResponseEntity<?> response = controller().complete(request, servletResponse);
 
         assertThat(response.getStatusCode().value()).isEqualTo(400);
     }
@@ -141,7 +150,7 @@ class NapAuthControllerTest {
         request.setAttribute(NapServletFilter.RAW_BODY_ATTRIBUTE, "{}".getBytes());
         MockHttpServletResponse servletResponse = new MockHttpServletResponse();
 
-        ResponseEntity<?> response = controller().complete(false, request, servletResponse);
+        ResponseEntity<?> response = controller().complete(request, servletResponse);
 
         assertThat(response.getStatusCode().value()).isEqualTo(401);
     }

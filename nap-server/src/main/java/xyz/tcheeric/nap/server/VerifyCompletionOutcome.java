@@ -9,7 +9,16 @@ public sealed interface VerifyCompletionOutcome {
     record Success(SessionRecord session) implements VerifyCompletionOutcome {
     }
 
-    record Failure(NapErrorCode code, boolean retryable) implements VerifyCompletionOutcome {
+    /**
+     * @param retryAfterSeconds set only on {@code NAP_COMPLETE_RATE_LIMITED}; adapters surface
+     *                          it as the {@code Retry-After} header on the 429.
+     */
+    record Failure(NapErrorCode code, boolean retryable, Integer retryAfterSeconds)
+            implements VerifyCompletionOutcome {
+
+        public Failure(NapErrorCode code, boolean retryable) {
+            this(code, retryable, null);
+        }
     }
 
     record MalformedRequest() implements VerifyCompletionOutcome {
@@ -20,7 +29,11 @@ public sealed interface VerifyCompletionOutcome {
     }
 
     static VerifyCompletionOutcome failure(NapErrorCode code) {
-        return new Failure(code, code.isRetryable());
+        return new Failure(code, code.isRetryable(), null);
+    }
+
+    static VerifyCompletionOutcome rateLimited(NapErrorCode code, Integer retryAfterSeconds) {
+        return new Failure(code, code.isRetryable(), retryAfterSeconds);
     }
 
     static VerifyCompletionOutcome malformed() {

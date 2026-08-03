@@ -91,8 +91,14 @@ public class NapSessionFilter extends OncePerRequestFilter {
 
         AclDecision aclDecision = resolveAcl(record);
         if (!aclDecision.allowed()) {
-            log.warn("nap_session_acl_denied pubkey={} session_id={}", record.principalPubkey(), record.sessionId());
-            sessionStore.revokeBySessionId(record.sessionId(), Instant.now().getEpochSecond());
+            log.warn("nap_session_acl_denied pubkey={} session_id={} reason={}",
+                    record.principalPubkey(), record.sessionId(), aclDecision.reason());
+            // Only an affirmative denial ends the session. A resolver that answers "denied"
+            // because it could not read the ACL — a lagging replica, a row mid-rewrite —
+            // blocks this request and no more; revoking would cost a fresh NIP-98 login.
+            if (aclDecision.revokeSessions()) {
+                sessionStore.revokeBySessionId(record.sessionId(), Instant.now().getEpochSecond());
+            }
             response.setStatus(HttpServletResponse.SC_FORBIDDEN);
             return;
         }

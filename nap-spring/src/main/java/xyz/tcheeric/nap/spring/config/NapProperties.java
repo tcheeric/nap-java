@@ -16,6 +16,15 @@ public record NapProperties(
         int maxClockSkewSeconds,
         int stepUpTtlSeconds,
         int aclRefreshIntervalSeconds,
+        Boolean rateLimitEnabled,
+        int rateLimitWindowSeconds,
+        int rateLimitMaxPerWindow,
+        Integer maxOutstandingChallengesPerNpub,
+        Integer maxOutstandingChallengesPerIp,
+        Integer maxFailuresPerChallenge,
+        Integer minAuthResponseMillis,
+        Integer responseJitterMillis,
+        int maxBodyBytes,
         List<String> protectedPathPrefixes,
         CookieProperties cookie
 ) {
@@ -25,6 +34,18 @@ public record NapProperties(
     public static final int DEFAULT_SESSION_ABSOLUTE_TTL_SECONDS = 43200;
 
     public NapProperties {
+        // The bound knobs below are boxed so that "unset" and "explicitly 0" stay
+        // distinguishable: 0 is a meaningful value for each of them (cap disabled,
+        // padding off in tests), which the ≤0-means-unset convention above cannot express.
+        if (rateLimitEnabled == null) rateLimitEnabled = Boolean.TRUE;
+        if (rateLimitWindowSeconds <= 0) rateLimitWindowSeconds = 60;
+        if (rateLimitMaxPerWindow <= 0) rateLimitMaxPerWindow = 30;
+        if (maxOutstandingChallengesPerNpub == null) maxOutstandingChallengesPerNpub = 10;
+        if (maxOutstandingChallengesPerIp == null) maxOutstandingChallengesPerIp = 30;
+        if (maxFailuresPerChallenge == null) maxFailuresPerChallenge = 5;
+        if (minAuthResponseMillis == null) minAuthResponseMillis = 100;
+        if (responseJitterMillis == null) responseJitterMillis = 25;
+        if (maxBodyBytes <= 0) maxBodyBytes = 1024;
         if (challengeTtlSeconds <= 0) challengeTtlSeconds = 60;
         if (sessionTtlSeconds <= 0) sessionTtlSeconds = 3600;
         // New sliding-window knobs. If unset (i.e. the caller still uses the old

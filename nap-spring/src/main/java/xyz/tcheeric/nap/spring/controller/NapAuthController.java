@@ -9,6 +9,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
+import xyz.tcheeric.nap.core.NapErrorCode;
 import xyz.tcheeric.nap.core.SessionRecord;
 import xyz.tcheeric.nap.core.SessionStore;
 import xyz.tcheeric.nap.server.*;
@@ -49,7 +50,7 @@ public class NapAuthController {
     }
 
     @PostMapping("/init")
-    public ResponseEntity<?> init(@RequestBody Map<String, String> body) {
+    public ResponseEntity<?> init(@RequestBody Map<String, String> body, HttpServletRequest request) {
         String npub = body.get("npub");
         String pubkey = body.get("pubkey");
 
@@ -61,7 +62,7 @@ public class NapAuthController {
         String authUrl = properties.externalBaseUrl() + "/api/v1/auth/complete";
 
         IssueChallengeResult result = napServer.issueChallenge(new IssueChallengeInput(
-                npub != null ? npub : pubkey, authUrl));
+                npub != null ? npub : pubkey, authUrl, "POST", request.getRemoteAddr()));
 
         return switch (result) {
             case IssueChallengeResult.Success s -> ResponseEntity.ok(Map.of(
@@ -72,16 +73,19 @@ public class NapAuthController {
                     "issued_at", s.value().issuedAt(),
                     "expires_at", s.value().expiresAt()
             ));
+            case IssueChallengeResult.Failure f when f.code() == NapErrorCode.NAP_INIT_RATE_LIMITED ->
+                    rateLimited(f.retryAfterSeconds());
             case IssueChallengeResult.Failure f -> ResponseEntity.badRequest()
                     .body(Map.of("status", "error", "code", f.code().name()));
         };
     }
 
+    /**
+     * {@code step_up} is read from the signed body, not the query string — see
+     * {@link xyz.tcheeric.nap.core.AuthCompleteRequest}.
+     */
     @PostMapping("/complete")
-    public ResponseEntity<?> complete(
-            @RequestParam(value = "step_up", required = false, defaultValue = "false") boolean stepUp,
-            HttpServletRequest request,
-            HttpServletResponse response) {
+    public ResponseEntity<?> complete(HttpServletRequest request, HttpServletResponse response) {
 
         byte[] rawBody = (byte[]) request.getAttribute(NapServletFilter.RAW_BODY_ATTRIBUTE);
         if (rawBody == null) {
@@ -93,7 +97,7 @@ public class NapAuthController {
         String authorization = resolveAuthorization(request, rawBody);
 
         VerifyCompletionOutcome outcome = napServer.verifyCompletion(new VerifyCompletionInput(
-                authorization, "POST", authUrl, rawBody));
+                authorization, "POST", authUrl, rawBody, request.getRemoteAddr()));
 
         return switch (outcome) {
             case VerifyCompletionOutcome.Success s -> {
@@ -101,6 +105,10 @@ public class NapAuthController {
                 var successResponse = napServer.toPublicAuthSuccess(s.session());
                 yield ResponseEntity.ok(successResponse);
             }
+            // Rate limiting is not an authentication failure, and hiding it behind one only
+            // makes clients retry harder.
+            case VerifyCompletionOutcome.Failure f when f.code() == NapErrorCode.NAP_COMPLETE_RATE_LIMITED ->
+                    rateLimited(f.retryAfterSeconds());
             case VerifyCompletionOutcome.Failure f -> {
                 log.warn("nap_complete_failed code={}", f.code());
                 yield ResponseEntity.status(HttpStatus.UNAUTHORIZED)
@@ -110,6 +118,14 @@ public class NapAuthController {
                     ResponseEntity.badRequest()
                             .body(Map.of("status", "error", "message", "bad request"));
         };
+    }
+
+    private static ResponseEntity<?> rateLimited(Integer retryAfterSeconds) {
+        var builder = ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS);
+        if (retryAfterSeconds != null) {
+            builder.header("Retry-After", String.valueOf(retryAfterSeconds));
+        }
+        return builder.body(Map.of("status", "error", "message", "rate limited"));
     }
 
     /**
