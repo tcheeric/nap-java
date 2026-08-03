@@ -437,4 +437,61 @@ class NapAuthControllerTest {
         assertThat(cookie.getSecure()).isTrue();
         assertThat(cookie.isHttpOnly()).isTrue();
     }
+
+    /**
+     * The test above pins the clear against a known config, which is what caught the
+     * regression. This one pins the invariant behind it: the set and the clear may differ
+     * on value and max-age and on nothing else. Both go through {@code sessionCookie()}
+     * today, so it cannot fail — it fails the day someone reintroduces a bespoke
+     * {@code setCookie}, which is the only way this bug comes back.
+     */
+    @Test
+    void setAndClearCookiesDifferOnlyInValueAndMaxAge() {
+        NapProperties domainScoped = propertiesWith(
+                new NapProperties.CookieProperties("merchant_session", true, true, "Strict", "/app", ".imani.casa", 43200));
+        NapAuthController controller = controller(domainScoped);
+
+        long now = Instant.now().getEpochSecond();
+        SessionRecord session = SessionRecord.create(
+                "sid-sym", "chal-sym", "token-sym",
+                "npub-sym", "f".repeat(64),
+                List.of(), List.of(),
+                now, now, now + 900, now + 43200
+        );
+        when(napServer.verifyCompletion(any())).thenReturn(VerifyCompletionOutcome.success(session));
+        when(napServer.toPublicAuthSuccess(session)).thenReturn(new AuthSuccessResponse(
+                "ok", session.accessToken(), "Bearer",
+                session.expiresAt(), session.absoluteExpiryAt(),
+                new AuthSuccessResponse.Principal(session.principalNpub(), session.principalPubkey()),
+                session.roles(), session.permissions()
+        ));
+
+        MockHttpServletRequest completeRequest = new MockHttpServletRequest("POST", "/api/v1/auth/complete");
+        completeRequest.setAttribute(NapServletFilter.RAW_BODY_ATTRIBUTE,
+                "{\"challenge_id\":\"chal-sym\",\"proof\":\"Nostr p\"}".getBytes());
+        MockHttpServletResponse completeResponse = new MockHttpServletResponse();
+        controller.complete(completeRequest, completeResponse);
+
+        MockHttpServletRequest logoutRequest = new MockHttpServletRequest("POST", "/api/v1/auth/logout");
+        logoutRequest.setCookies(new Cookie("merchant_session", "sid-sym"));
+        MockHttpServletResponse logoutResponse = new MockHttpServletResponse();
+        controller.logout(logoutRequest, logoutResponse);
+
+        Cookie set = completeResponse.getCookie("merchant_session");
+        Cookie cleared = logoutResponse.getCookie("merchant_session");
+        assertThat(set).isNotNull();
+        assertThat(cleared).isNotNull();
+
+        assertThat(cleared.getName()).isEqualTo(set.getName());
+        assertThat(cleared.getDomain()).isEqualTo(set.getDomain());
+        assertThat(cleared.getPath()).isEqualTo(set.getPath());
+        assertThat(cleared.getAttribute("SameSite")).isEqualTo(set.getAttribute("SameSite"));
+        assertThat(cleared.getSecure()).isEqualTo(set.getSecure());
+        assertThat(cleared.isHttpOnly()).isEqualTo(set.isHttpOnly());
+
+        // The two that must differ, or the clear would be a renewal.
+        assertThat(set.getMaxAge()).isEqualTo(43200);
+        assertThat(cleared.getMaxAge()).isEqualTo(0);
+        assertThat(cleared.getValue()).isEmpty();
+    }
 }
