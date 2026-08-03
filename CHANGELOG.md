@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Logout now actually clears the cookie under `nap.cookie.domain`.**
+  `NapAuthController.clearCookie` wrote the deletion without `domain` or `SameSite`
+  while `setCookie` wrote both. A browser matches a deletion against name + domain +
+  path, so any deployment configuring a cookie domain got a logout that returned 204
+  and left the session cookie in the jar. Both paths now go through one
+  `sessionCookie(value, maxAge)` builder, which is what keeps them from drifting apart
+  again.
+
 ## [0.4.0] - 2026-08-04
 
 Parity with the TypeScript workspace's Unreleased section — refresh tokens, metrics, and

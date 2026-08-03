@@ -271,27 +271,33 @@ public class NapAuthController {
     }
 
     private void setCookie(HttpServletResponse response, String sessionId) {
+        response.addCookie(sessionCookie(sessionId, properties.cookie().maxAgeSeconds()));
+    }
+
+    private void clearCookie(HttpServletResponse response) {
+        response.addCookie(sessionCookie("", 0));
+    }
+
+    /**
+     * Both the set and the clear go through here, because a browser matches a deletion
+     * against name + domain + path and will keep a cookie whose delete arrived without the
+     * attributes it was written with. `clearCookie` used to omit {@code domain} and
+     * {@code SameSite}, so under any deployment configuring {@code nap.cookie.domain} the
+     * logout left the cookie in place — a logout that returns 204 and does not log out.
+     * Sharing one builder is what keeps the two from drifting apart again.
+     */
+    private Cookie sessionCookie(String value, int maxAgeSeconds) {
         var cookieProps = properties.cookie();
-        Cookie cookie = new Cookie(cookieProps.name(), sessionId);
+        Cookie cookie = new Cookie(cookieProps.name(), value);
         cookie.setHttpOnly(cookieProps.httpOnly());
         cookie.setSecure(cookieProps.secure());
         cookie.setPath(cookieProps.path());
-        cookie.setMaxAge(cookieProps.maxAgeSeconds());
+        cookie.setMaxAge(maxAgeSeconds);
         cookie.setAttribute("SameSite", cookieProps.sameSite());
         if (cookieProps.domain() != null && !cookieProps.domain().isBlank()) {
             cookie.setDomain(cookieProps.domain());
         }
-        response.addCookie(cookie);
-    }
-
-    private void clearCookie(HttpServletResponse response) {
-        var cookieProps = properties.cookie();
-        Cookie cookie = new Cookie(cookieProps.name(), "");
-        cookie.setHttpOnly(cookieProps.httpOnly());
-        cookie.setSecure(cookieProps.secure());
-        cookie.setPath(cookieProps.path());
-        cookie.setMaxAge(0);
-        response.addCookie(cookie);
+        return cookie;
     }
 
     private String extractCookie(HttpServletRequest request) {

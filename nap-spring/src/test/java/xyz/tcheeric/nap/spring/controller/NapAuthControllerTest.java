@@ -42,7 +42,11 @@ class NapAuthControllerTest {
     private final NapServer napServer = mock(NapServer.class);
     private final ObjectMapper objectMapper = new ObjectMapper();
     private final SessionStore sessionStore = new InMemorySessionStore();
-    private final NapProperties properties = new NapProperties(
+    private final NapProperties properties =
+            propertiesWith(new NapProperties.CookieProperties("merchant_session", true, true, "Lax", "/", "", 43200));
+
+    private static NapProperties propertiesWith(NapProperties.CookieProperties cookie) {
+        return new NapProperties(
             true,
             "https://account.imani.casa",
             60,     // challengeTtlSeconds
@@ -64,11 +68,16 @@ class NapAuthControllerTest {
             null,   // responseJitterMillis
             0,      // maxBodyBytes
             List.of("/internal/v1/merchants"),
-            new NapProperties.CookieProperties("merchant_session", true, true, "Lax", "/", "", 43200)
-    );
+            cookie
+        );
+    }
 
     private NapAuthController controller() {
-        return new NapAuthController(napServer, sessionStore, properties, objectMapper);
+        return controller(properties);
+    }
+
+    private NapAuthController controller(NapProperties props) {
+        return new NapAuthController(napServer, sessionStore, props, objectMapper);
     }
 
     @Test
@@ -401,5 +410,31 @@ class NapAuthControllerTest {
         assertThat(cookie.getMaxAge()).isEqualTo(0);
         // Session is revoked in the store — subsequent getBySessionId filters it out.
         assertThat(sessionStore.getBySessionId("sid-live")).isEmpty();
+    }
+
+    /**
+     * A browser matches a deletion against name + domain + path, and drops a Set-Cookie whose
+     * SameSite it disagrees with. A clear that omits either attribute leaves the cookie in the
+     * jar: logout returns 204 and the user is still logged in.
+     */
+    @Test
+    void logout_clearedCookieCarriesTheAttributesTheSetWroteWith() {
+        NapProperties domainScoped = propertiesWith(
+                new NapProperties.CookieProperties("merchant_session", true, true, "Lax", "/", ".imani.casa", 43200));
+
+        MockHttpServletRequest request = new MockHttpServletRequest("POST", "/api/v1/auth/logout");
+        request.setCookies(new Cookie("merchant_session", "sid-gone"));
+        MockHttpServletResponse response = new MockHttpServletResponse();
+
+        controller(domainScoped).logout(request, response);
+
+        Cookie cookie = response.getCookie("merchant_session");
+        assertThat(cookie).isNotNull();
+        assertThat(cookie.getMaxAge()).isEqualTo(0);
+        assertThat(cookie.getDomain()).isEqualTo(".imani.casa");
+        assertThat(cookie.getPath()).isEqualTo("/");
+        assertThat(cookie.getAttribute("SameSite")).isEqualTo("Lax");
+        assertThat(cookie.getSecure()).isTrue();
+        assertThat(cookie.isHttpOnly()).isTrue();
     }
 }
