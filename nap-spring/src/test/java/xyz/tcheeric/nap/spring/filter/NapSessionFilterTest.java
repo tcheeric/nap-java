@@ -18,9 +18,11 @@ import java.util.Optional;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -43,8 +45,35 @@ class NapSessionFilterTest {
         SessionRecord session = sessionRecord();
         when(sessionStore.getBySessionId("session-123")).thenReturn(Optional.of(session));
         when(aclResolver.resolve(session.principalNpub(), session.principalPubkey()))
-                .thenReturn(AclDecision.denied("suspended"));
+                .thenReturn(AclDecision.denied("suspended", true));
 
+        MockHttpServletResponse response = denyAndCapture();
+
+        assertThat(response.getStatus()).isEqualTo(403);
+        // Every session the principal holds, not just the one that happened to make this
+        // request: a suspension the ACL states affirmatively is about the principal.
+        verify(sessionStore).revokeByPrincipal(eq(session.principalPubkey()), anyLong());
+        verify(sessionStore, never()).revokeBySessionId(any(), anyLong());
+    }
+
+    @Test
+    void doFilterInternal_deniesWithoutRevokingWhenTheDenialIsNotAffirmative() throws Exception {
+        // A resolver that answers "denied" because it could not read the ACL — a lagging
+        // replica, a row mid-rewrite — blocks this request and no more. Revoking would cost
+        // the user a fresh NIP-98 login for someone else's transient failure.
+        SessionRecord session = sessionRecord();
+        when(sessionStore.getBySessionId("session-123")).thenReturn(Optional.of(session));
+        when(aclResolver.resolve(session.principalNpub(), session.principalPubkey()))
+                .thenReturn(AclDecision.denied("acl_unavailable"));
+
+        MockHttpServletResponse response = denyAndCapture();
+
+        assertThat(response.getStatus()).isEqualTo(403);
+        verify(sessionStore, never()).revokeByPrincipal(any(), anyLong());
+        verify(sessionStore, never()).revokeBySessionId(any(), anyLong());
+    }
+
+    private MockHttpServletResponse denyAndCapture() throws Exception {
         NapSessionFilter filter = new NapSessionFilter(
                 sessionStore,
                 aclResolver,
@@ -52,15 +81,11 @@ class NapSessionFilterTest {
                 List.of("/internal/v1/merchants"),
                 Duration.ofMinutes(5)
         );
-        MockHttpServletRequest request = request();
         MockHttpServletResponse response = new MockHttpServletResponse();
-
-        filter.doFilterInternal(request, response, (req, res) -> {
+        filter.doFilterInternal(request(), response, (req, res) -> {
             throw new AssertionError("denied session should not reach the handler");
         });
-
-        assertThat(response.getStatus()).isEqualTo(403);
-        verify(sessionStore).revokeBySessionId(eq(session.sessionId()), anyLong());
+        return response;
     }
 
     @Test

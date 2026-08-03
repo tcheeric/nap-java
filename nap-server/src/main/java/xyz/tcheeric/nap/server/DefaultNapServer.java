@@ -1,5 +1,6 @@
 package xyz.tcheeric.nap.server;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -11,7 +12,7 @@ import xyz.tcheeric.nap.core.SessionStore;
 
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
-import java.util.List;
+import java.util.OptionalInt;
 
 /**
  * Default NAP server implementation matching the TypeScript reference.
@@ -29,36 +30,66 @@ final class DefaultNapServer implements NapServer {
 
     @Override
     public IssueChallengeResult issueChallenge(IssueChallengeInput input) {
+        // Padded in a finally so a store outage answers on the same schedule as a refusal:
+        // an unpadded 500 next to padded 401s is itself a distinguishable response.
+        long startedAtNanos = System.nanoTime();
+        IssueChallengeResult result = null;
+        try {
+            result = issueChallengeUnpadded(input);
+            return result;
+        } finally {
+            if (!isRateLimited(result, NapErrorCode.NAP_INIT_RATE_LIMITED)) {
+                padAuthResponse(startedAtNanos);
+            }
+        }
+    }
+
+    private IssueChallengeResult issueChallengeUnpadded(IssueChallengeInput input) {
         if (input.authUrl() == null || input.authUrl().isBlank()) {
-            return new IssueChallengeResult.Failure(
-                    NapErrorCode.NAP_INIT_INTERNAL,
-                    NapErrorCode.NAP_INIT_INTERNAL.isRetryable());
+            return IssueChallengeResult.failure(NapErrorCode.NAP_INIT_INTERNAL);
+        }
+
+        RateLimitDecision rateLimit = checkRateLimit(
+                RateLimitKey.init(boundedNpub(input.npub()), input.clientIp()));
+        if (!rateLimit.allowed()) {
+            log.warn("nap_init_rate_limited npub={}", input.npub());
+            return IssueChallengeResult.rateLimited(
+                    NapErrorCode.NAP_INIT_RATE_LIMITED, rateLimit.retryAfterSeconds());
         }
 
         String pubkey = decodeNpub(input.npub());
         if (pubkey == null) {
-            return new IssueChallengeResult.Failure(
-                    NapErrorCode.NAP_INIT_INVALID_NPUB,
-                    NapErrorCode.NAP_INIT_INVALID_NPUB.isRetryable());
+            return IssueChallengeResult.failure(NapErrorCode.NAP_INIT_INVALID_NPUB);
         }
 
         long now = options.clock().instant().getEpochSecond();
+
+        String exceeded = findExceededOutstandingCap(input.npub(), input.clientIp(), now);
+        if (exceeded != null) {
+            // Reported as rate limiting rather than a distinct code: the cap exists to bound
+            // storage, and telling the caller which dimension they hit tells them how to
+            // spread the load to evade it.
+            log.warn("nap_init_rate_limited npub={} cap={}", input.npub(), exceeded);
+            // The oldest outstanding challenge expires within one TTL at the latest, which is
+            // when a slot frees up — so that is the honest Retry-After.
+            return IssueChallengeResult.rateLimited(
+                    NapErrorCode.NAP_INIT_RATE_LIMITED, options.challengeTtlSeconds());
+        }
+
         String challengeId = base64Url(randomBytes(12));
         String challenge = base64Url(randomBytes(32));
 
         ChallengeRecord record = ChallengeRecord.issued(
                 challengeId, challenge, input.npub(), pubkey,
                 input.authUrl(), input.authMethod() != null ? input.authMethod() : "POST",
-                now, now + options.challengeTtlSeconds()
+                now, now + options.challengeTtlSeconds(), input.clientIp()
         );
 
         try {
             options.challengeStore().create(record);
         } catch (Exception e) {
             log.error("Failed to store challenge: {}", e.getMessage(), e);
-            return new IssueChallengeResult.Failure(
-                    NapErrorCode.NAP_INIT_INTERNAL,
-                    NapErrorCode.NAP_INIT_INTERNAL.isRetryable());
+            return IssueChallengeResult.failure(NapErrorCode.NAP_INIT_INTERNAL);
         }
 
         return new IssueChallengeResult.Success(new AuthInitResponse(
@@ -70,13 +101,35 @@ final class DefaultNapServer implements NapServer {
 
     @Override
     public VerifyCompletionOutcome verifyCompletion(VerifyCompletionInput input) {
+        long startedAtNanos = System.nanoTime();
+        VerifyCompletionOutcome outcome = null;
+        try {
+            outcome = verifyCompletionUnpadded(input);
+            return outcome;
+        } finally {
+            if (!isRateLimited(outcome, NapErrorCode.NAP_COMPLETE_RATE_LIMITED)) {
+                padAuthResponse(startedAtNanos);
+            }
+        }
+    }
+
+    private VerifyCompletionOutcome verifyCompletionUnpadded(VerifyCompletionInput input) {
         if (input.rawBody() == null) {
             return VerifyCompletionOutcome.malformed();
         }
 
+        // RFC §13.4(1): reject malformed requests before touching challenge state.
         AuthCompleteRequest body = parseAuthCompleteRequest(input.rawBody());
         if (body == null) {
             return VerifyCompletionOutcome.malformed();
+        }
+
+        RateLimitDecision rateLimit = checkRateLimit(
+                RateLimitKey.complete(null, input.clientIp()));
+        if (!rateLimit.allowed()) {
+            log.warn("nap_complete_rate_limited challenge_id={}", body.challengeId());
+            return VerifyCompletionOutcome.rateLimited(
+                    NapErrorCode.NAP_COMPLETE_RATE_LIMITED, rateLimit.retryAfterSeconds());
         }
 
         long now = options.clock().instant().getEpochSecond();
@@ -92,6 +145,23 @@ final class DefaultNapServer implements NapServer {
 
         var verified = ((Nip98Validator.Nip98ValidationResult.Success) proof).value();
 
+        // Second check, now that the request has proved who it is. The pre-proof check above
+        // has only clientIp, and an adapter behind an untrusted proxy is told to report none —
+        // which left the one endpoint that runs a Schnorr verify per call with no bound at
+        // all. Counting the proved pubkey costs an attacker one signature per counted request.
+        //
+        // No clientIp on this key: the pre-proof check already spent the address's budget for
+        // this request, and counting it twice would halve the configured per-address rate —
+        // unevenly, since a request rejected before the proof only spends it once.
+        RateLimitDecision provenRateLimit = checkRateLimit(
+                RateLimitKey.complete(verified.event().pubkey(), null));
+        if (!provenRateLimit.allowed()) {
+            log.warn("nap_complete_rate_limited pubkey={} challenge_id={}",
+                    verified.event().pubkey(), body.challengeId());
+            return VerifyCompletionOutcome.rateLimited(
+                    NapErrorCode.NAP_COMPLETE_RATE_LIMITED, provenRateLimit.retryAfterSeconds());
+        }
+
         var challenge = options.challengeStore().get(verified.challengeId()).orElse(null);
         if (challenge == null) {
             return VerifyCompletionOutcome.failure(NapErrorCode.NAP_COMPLETE_UNKNOWN_CHALLENGE);
@@ -106,21 +176,38 @@ final class DefaultNapServer implements NapServer {
             return VerifyCompletionOutcome.failure(NapErrorCode.NAP_COMPLETE_EXPIRED_CHALLENGE);
         }
 
-        if (!challenge.challenge().equals(verified.challenge())) {
-            return VerifyCompletionOutcome.failure(NapErrorCode.NAP_COMPLETE_CHALLENGE_MISMATCH);
+        // RFC §13.4(3): a challenge that burned through its failure budget is dead even
+        // though it has not expired yet.
+        if (challenge.state() == ChallengeState.FAILED_TERMINAL) {
+            return VerifyCompletionOutcome.failure(NapErrorCode.NAP_COMPLETE_FAILED_TERMINAL);
         }
 
+        // Principal first, and deliberately without spending budget. Whoever signed this proof
+        // is not the principal the challenge was issued to, so letting them count failures
+        // would let anyone holding a victim's challenge_id burn it to failed_terminal with
+        // proofs from their own key. Only the principal can spend their own budget.
         if (!challenge.pubkey().equals(verified.event().pubkey())) {
             return VerifyCompletionOutcome.failure(NapErrorCode.NAP_COMPLETE_PRINCIPAL_MISMATCH);
+        }
+
+        // Past this point the request is addressing a live challenge we loaded, matched, and
+        // proved ownership of, so failures count against that challenge's budget
+        // (RFC §13.4(2)). A wrong challenge_id cannot burn down another principal's live
+        // challenge, and neither can a right one signed by the wrong key.
+        if (!challenge.challenge().equals(verified.challenge())) {
+            recordChallengeFailure(challenge.challengeId(), now);
+            return VerifyCompletionOutcome.failure(NapErrorCode.NAP_COMPLETE_CHALLENGE_MISMATCH);
         }
 
         if (!Nip98Validator.validateChallengeBoundCreatedAt(
                 verified.event().createdAt(),
                 challenge.issuedAt(), challenge.expiresAt(),
                 options.lowerBoundGraceSeconds(), options.upperBoundGraceSeconds())) {
+            recordChallengeFailure(challenge.challengeId(), now);
             return VerifyCompletionOutcome.failure(NapErrorCode.NAP_COMPLETE_CREATED_AT_OUT_OF_RANGE);
         }
 
+        // An ACL denial is deterministic, not a guessing attack, so it does not spend budget.
         AclDecision aclDecision = options.aclResolver().resolve(challenge.npub(), challenge.pubkey());
         if (!aclDecision.allowed()) {
             return VerifyCompletionOutcome.failure(NapErrorCode.NAP_COMPLETE_ACL_DENIED);
@@ -134,13 +221,20 @@ final class DefaultNapServer implements NapServer {
 
         long absoluteExpiryAt = now + options.sessionAbsoluteTtlSeconds();
         long idleExpiresAt = Math.min(now + options.sessionIdleTtlSeconds(), absoluteExpiryAt);
-        SessionRecord session = options.sessionStore().createForChallenge(SessionRecord.create(
+        // A step-up is a full re-authentication: the caller proved key control again, just
+        // now, so the resulting session carries a short-lived token. The flag is signed (it
+        // lives in the hashed body), so it cannot be added in transit to mint a token the
+        // user never asked for.
+        String stepUpToken = body.stepUp() ? base64Url(randomBytes(32)) : null;
+        Long stepUpExpiresAt = body.stepUp() ? now + options.stepUpTtlSeconds() : null;
+        SessionRecord session = options.sessionStore().createForChallenge(new SessionRecord(
                 base64Url(randomBytes(24)),
                 challenge.challengeId(),
                 base64Url(randomBytes(32)),
                 challenge.npub(), challenge.pubkey(),
                 aclDecision.roles(), aclDecision.permissions(),
-                now, now, idleExpiresAt, absoluteExpiryAt
+                now, now, idleExpiresAt, absoluteExpiryAt,
+                null, stepUpToken, stepUpExpiresAt
         ));
 
         RedeemResult redeemResult = options.challengeStore().redeem(challenge.challengeId(), new RedeemParams(
@@ -182,13 +276,131 @@ final class DefaultNapServer implements NapServer {
                 "ok",
                 session.accessToken(), "Bearer", session.expiresAt(), session.absoluteExpiryAt(),
                 new AuthSuccessResponse.Principal(session.principalNpub(), session.principalPubkey()),
-                session.roles(), session.permissions()
+                session.roles(), session.permissions(),
+                session.stepUpToken(), session.stepUpExpiresAt()
         );
     }
 
     @Override
     public PublicFailureResponse toPublicAuthFailure() {
         return new PublicFailureResponse(401, AuthFailureResponse.authenticationFailed());
+    }
+
+    private RateLimitDecision checkRateLimit(RateLimitKey key) {
+        RateLimiter limiter = options.rateLimiter();
+        return limiter == null ? RateLimitDecision.allow() : limiter.check(key);
+    }
+
+    /** A bech32 npub is 63 characters. */
+    private static final int MAX_NPUB_KEY_LENGTH = 128;
+
+    /**
+     * The npub is unvalidated at the point the limiter counts it — decoding happens later — so
+     * an oversized one would become a map key an attacker chose the size of. Dropping the
+     * dimension rather than truncating keeps two distinct npubs from sharing a budget; the
+     * request is still counted against the caller's address.
+     */
+    private static String boundedNpub(String npub) {
+        return npub != null && npub.length() <= MAX_NPUB_KEY_LENGTH ? npub : null;
+    }
+
+    private static boolean isRateLimited(IssueChallengeResult result, NapErrorCode code) {
+        return result instanceof IssueChallengeResult.Failure failure && failure.code() == code;
+    }
+
+    private static boolean isRateLimited(VerifyCompletionOutcome outcome, NapErrorCode code) {
+        return outcome instanceof VerifyCompletionOutcome.Failure failure && failure.code() == code;
+    }
+
+    /**
+     * RFC §17.4: bound outstanding challenges per principal and per caller address.
+     *
+     * <p>Returns the exceeded dimension, or {@code null}. Skipped entirely when the store does
+     * not implement {@code countOutstanding} — a store that cannot count cannot cap, and
+     * failing closed here would break every existing custom store.
+     *
+     * <p>The per-npub count is scoped to the caller's address when there is one. {@code /auth/init}
+     * is unauthenticated and npubs are public, so a cap counting one npub across all addresses
+     * is an account-lockout primitive: fill a stranger's ten slots and they cannot log in until
+     * the challenges expire. Scoping by address costs nothing in storage terms — the per-address
+     * cap already bounds what any one caller can accumulate.
+     */
+    private String findExceededOutstandingCap(String npub, String clientIp, long now) {
+        int perNpub = options.maxOutstandingChallengesPerNpub();
+        if (perNpub > 0) {
+            OutstandingChallengeFilter filter = clientIp != null
+                    ? OutstandingChallengeFilter.forNpubAtClientIp(npub, clientIp, now)
+                    : OutstandingChallengeFilter.forNpub(npub, now);
+            OptionalInt count = options.challengeStore().countOutstanding(filter);
+            if (count.isPresent() && count.getAsInt() >= perNpub) {
+                return "npub";
+            }
+        }
+
+        int perIp = options.maxOutstandingChallengesPerIp();
+        if (perIp > 0 && clientIp != null) {
+            OptionalInt count = options.challengeStore()
+                    .countOutstanding(OutstandingChallengeFilter.forClientIp(clientIp, now));
+            if (count.isPresent() && count.getAsInt() >= perIp) {
+                return "ip";
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * RFC §13.4: cap failures per challenge. The public response is the same 401 either way;
+     * this only moves the challenge to {@code failed_terminal} and says so in the log.
+     */
+    private void recordChallengeFailure(String challengeId, long now) {
+        int maxFailures = options.maxFailuresPerChallenge();
+        if (maxFailures <= 0) {
+            return;
+        }
+
+        RecordChallengeFailureResult result =
+                options.challengeStore().recordFailure(challengeId, now, maxFailures);
+        if (result != null && result.state() == ChallengeState.FAILED_TERMINAL) {
+            log.warn("nap_complete_failed_terminal challenge_id={} failure_count={}",
+                    challengeId, result.failureCount());
+        }
+    }
+
+    /**
+     * RFC §15: hold every auth response to a fixed floor plus jitter.
+     *
+     * <p>The generic 401 hides <em>which</em> check failed; latency did not — a request
+     * rejected before the signature check returns measurably sooner than one that ran a
+     * Schnorr verify. Jitter alone would not close it (it hides samples, not the mean), so
+     * the floor does the work.
+     *
+     * <p>Not applied to a rate-limited response. A 429 is already distinguishable by its status
+     * code, so padding buys no cover there — it only hands a caller who is <em>already</em> over
+     * the limit a free hold on a request thread for the floor's duration, which is the
+     * amplification the limiter exists to prevent.
+     */
+    private void padAuthResponse(long startedAtNanos) {
+        int floor = options.minAuthResponseMillis();
+        int jitterRange = options.responseJitterMillis();
+        if (floor <= 0 && jitterRange <= 0) {
+            return;
+        }
+
+        int jitter = jitterRange > 0 ? randomBytes(1)[0] & 0xFF : 0;
+        if (jitterRange > 0) {
+            jitter %= jitterRange + 1;
+        }
+
+        long elapsedMillis = (System.nanoTime() - startedAtNanos) / 1_000_000L;
+        long remaining = floor + jitter - elapsedMillis;
+        if (remaining > 0) {
+            try {
+                Thread.sleep(remaining);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
     }
 
     private AuthCompleteRequest parseAuthCompleteRequest(byte[] rawBody) {
@@ -198,7 +410,13 @@ final class DefaultNapServer implements NapServer {
             if (challengeId == null || challengeId.isEmpty()) {
                 return null;
             }
-            return new AuthCompleteRequest(challengeId);
+            // Reject a non-boolean step_up rather than coercing it: the flag is inside the
+            // hashed body, so anything but true/false is a client bug or a probe.
+            JsonNode stepUp = node.path("step_up");
+            if (!stepUp.isMissingNode() && !stepUp.isNull() && !stepUp.isBoolean()) {
+                return null;
+            }
+            return new AuthCompleteRequest(challengeId, stepUp.asBoolean(false));
         } catch (Exception e) {
             return null;
         }

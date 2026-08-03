@@ -5,6 +5,8 @@ import org.slf4j.LoggerFactory;
 import xyz.tcheeric.nap.core.ChallengeRecord;
 import xyz.tcheeric.nap.core.ChallengeState;
 import xyz.tcheeric.nap.core.ChallengeStore;
+import xyz.tcheeric.nap.core.OutstandingChallengeFilter;
+import xyz.tcheeric.nap.core.RecordChallengeFailureResult;
 import xyz.tcheeric.nap.core.RedeemParams;
 import xyz.tcheeric.nap.core.RedeemResult;
 
@@ -14,6 +16,7 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.Optional;
+import java.util.OptionalInt;
 
 /**
  * PostgreSQL-backed ChallengeStore using plain JDBC.
@@ -31,8 +34,8 @@ public final class JdbcChallengeStore implements ChallengeStore {
     public void create(ChallengeRecord record) {
         String sql = """
                 INSERT INTO nap_challenges (challenge_id, challenge, npub, pubkey, auth_url, auth_method,
-                    state, issued_at, expires_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    state, issued_at, expires_at, client_ip, failure_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """;
         try (Connection conn = dataSource.getConnection();
              PreparedStatement ps = conn.prepareStatement(sql)) {
@@ -45,6 +48,8 @@ public final class JdbcChallengeStore implements ChallengeStore {
             ps.setString(7, record.state().toWireValue());
             ps.setLong(8, record.issuedAt());
             ps.setLong(9, record.expiresAt());
+            ps.setString(10, record.clientIp());
+            ps.setInt(11, record.failureCount());
             ps.executeUpdate();
         } catch (SQLException e) {
             throw new RuntimeException("Failed to create challenge", e);
@@ -111,6 +116,65 @@ public final class JdbcChallengeStore implements ChallengeStore {
         }
     }
 
+    @Override
+    public OptionalInt countOutstanding(OutstandingChallengeFilter filter) {
+        String sql = """
+                SELECT COUNT(*) AS count
+                FROM nap_challenges
+                WHERE state = 'issued'
+                  AND expires_at >= ?
+                  AND (?::text IS NULL OR npub = ?)
+                  AND (?::text IS NULL OR client_ip = ?)
+                """;
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setLong(1, filter.now());
+            ps.setString(2, filter.npub());
+            ps.setString(3, filter.npub());
+            ps.setString(4, filter.clientIp());
+            ps.setString(5, filter.clientIp());
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? OptionalInt.of(rs.getInt("count")) : OptionalInt.of(0);
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException("Failed to count outstanding challenges", e);
+        }
+    }
+
+    /**
+     * Increments and flips to {@code failed_terminal} in one statement so concurrent attempts
+     * on the same challenge cannot lose increments to a read-modify-write race and slip past
+     * the cap.
+     */
+    @Override
+    public RecordChallengeFailureResult recordFailure(String challengeId, long now, int maxFailures) {
+        String sql = """
+                UPDATE nap_challenges
+                SET failure_count = COALESCE(failure_count, 0) + 1,
+                    state = CASE
+                      WHEN COALESCE(failure_count, 0) + 1 >= ? THEN 'failed_terminal'
+                      ELSE state
+                    END
+                WHERE challenge_id = ? AND state = 'issued'
+                RETURNING failure_count, state
+                """;
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setInt(1, maxFailures);
+            ps.setString(2, challengeId);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) {
+                    return null;
+                }
+                return new RecordChallengeFailureResult(
+                        rs.getInt("failure_count"),
+                        ChallengeState.fromWireValue(rs.getString("state")));
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException("Failed to record challenge failure", e);
+        }
+    }
+
     private ChallengeRecord mapRow(ResultSet rs) throws SQLException {
         return new ChallengeRecord(
                 rs.getString("challenge_id"),
@@ -124,7 +188,9 @@ public final class JdbcChallengeStore implements ChallengeStore {
                 ChallengeState.fromWireValue(rs.getString("state")),
                 rs.getString("redeemed_event_id"),
                 rs.getString("redeemed_session_id"),
-                rs.getObject("result_cache_until") != null ? rs.getLong("result_cache_until") : null
+                rs.getObject("result_cache_until") != null ? rs.getLong("result_cache_until") : null,
+                rs.getString("client_ip"),
+                rs.getInt("failure_count")
         );
     }
 }

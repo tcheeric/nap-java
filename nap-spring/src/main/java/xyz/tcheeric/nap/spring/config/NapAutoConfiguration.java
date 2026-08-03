@@ -18,10 +18,15 @@ import xyz.tcheeric.nap.server.AllowAllAclResolver;
 import xyz.tcheeric.nap.server.EventReplayGuard;
 import xyz.tcheeric.nap.server.NapServer;
 import xyz.tcheeric.nap.server.NapServerOptions;
+import xyz.tcheeric.nap.server.RateLimiter;
+import xyz.tcheeric.nap.server.InMemoryRateLimiter;
+import xyz.tcheeric.nap.server.acl.PermissionRegistry;
 import xyz.tcheeric.nap.server.store.InMemoryChallengeStore;
 import xyz.tcheeric.nap.server.store.InMemorySessionStore;
 import xyz.tcheeric.nap.spring.controller.NapAuthController;
 import xyz.tcheeric.nap.spring.filter.NapPermissionInterceptor;
+
+import java.time.Clock;
 
 @AutoConfiguration(after = JacksonAutoConfiguration.class)
 @ConditionalOnWebApplication(type = ConditionalOnWebApplication.Type.SERVLET)
@@ -52,20 +57,43 @@ public class NapAutoConfiguration {
     public NapServer napServer(ChallengeStore challengeStore, SessionStore sessionStore,
                                AclResolver aclResolver,
                                NapProperties properties,
-                               ObjectProvider<EventReplayGuard> replayGuardProvider) {
+                               ObjectProvider<EventReplayGuard> replayGuardProvider,
+                               ObjectProvider<RateLimiter> rateLimiterProvider) {
         return NapServer.create(NapServerOptions.builder()
                 .challengeStore(challengeStore)
                 .sessionStore(sessionStore)
                 .aclResolver(aclResolver)
                 .eventReplayGuard(replayGuardProvider.getIfAvailable(EventReplayGuard::inMemory))
+                // An application-supplied RateLimiter wins; otherwise the in-memory one at
+                // the configured window, unless nap.rate-limit-enabled=false opts out. That
+                // opt-out is deliberate: the response floor holds every unauthenticated
+                // request open, which without a limiter amplifies concurrency.
+                .rateLimiter(rateLimiterProvider.getIfAvailable(() ->
+                        properties.rateLimitEnabled()
+                                ? InMemoryRateLimiter.create(
+                                        properties.rateLimitWindowSeconds(),
+                                        properties.rateLimitMaxPerWindow(),
+                                        Clock.systemUTC())
+                                : null))
                 .challengeTtlSeconds(properties.challengeTtlSeconds())
                 .sessionTtlSeconds(properties.sessionTtlSeconds())
                 .sessionIdleTtlSeconds(properties.sessionIdleTtlSeconds())
                 .sessionAbsoluteTtlSeconds(properties.sessionAbsoluteTtlSeconds())
                 .resultCacheTtlSeconds(properties.resultCacheTtlSeconds())
                 .maxClockSkewSeconds(properties.maxClockSkewSeconds())
+                .stepUpTtlSeconds(properties.stepUpTtlSeconds())
+                .maxOutstandingChallengesPerNpub(properties.maxOutstandingChallengesPerNpub())
+                .maxOutstandingChallengesPerIp(properties.maxOutstandingChallengesPerIp())
+                .maxFailuresPerChallenge(properties.maxFailuresPerChallenge())
+                .minAuthResponseMillis(properties.minAuthResponseMillis())
+                .responseJitterMillis(properties.responseJitterMillis())
                 .build());
     }
+
+    // No NapServletFilter / NapSessionFilter bean here, deliberately: both are registered by
+    // the application (usually through a FilterRegistrationBean, which ConditionalOnMissingBean
+    // would not see), and a second registration would consume the request body twice. The
+    // matching knobs — nap.max-body-bytes, nap.protected-path-prefixes — are read at that site.
 
     @Bean
     @ConditionalOnMissingBean
@@ -77,8 +105,10 @@ public class NapAutoConfiguration {
 
     @Bean
     @ConditionalOnMissingBean(name = "napPermissionInterceptor")
-    public HandlerInterceptor napPermissionInterceptor() {
-        return new NapPermissionInterceptor();
+    public HandlerInterceptor napPermissionInterceptor(ObjectProvider<PermissionRegistry> registryProvider) {
+        // With a registry present, a permission declared stepUp is enforced everywhere it is
+        // required, without @RequiresStepUp having to be repeated at every call site.
+        return new NapPermissionInterceptor(registryProvider.getIfAvailable());
     }
 
     @Bean

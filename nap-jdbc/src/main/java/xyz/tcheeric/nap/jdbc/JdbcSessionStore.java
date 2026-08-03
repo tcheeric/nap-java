@@ -47,8 +47,8 @@ public final class JdbcSessionStore implements SessionStore {
         String sql = """
                 INSERT INTO nap_sessions (session_id, challenge_id, access_token, principal_npub,
                     principal_pubkey, roles, permissions, issued_at, last_activity_at,
-                    expires_at, absolute_expiry_at)
-                VALUES (?, ?, ?, ?, ?, ?::jsonb, ?::jsonb, ?, ?, ?, ?)
+                    expires_at, absolute_expiry_at, step_up_token, step_up_expires_at)
+                VALUES (?, ?, ?, ?, ?, ?::jsonb, ?::jsonb, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (challenge_id) DO NOTHING
                 """;
         try (Connection conn = dataSource.getConnection();
@@ -64,6 +64,12 @@ public final class JdbcSessionStore implements SessionStore {
             ps.setLong(9, record.lastActivityAt());
             ps.setLong(10, record.expiresAt());
             ps.setLong(11, record.absoluteExpiryAt());
+            ps.setString(12, record.stepUpToken());
+            if (record.stepUpExpiresAt() == null) {
+                ps.setNull(13, java.sql.Types.BIGINT);
+            } else {
+                ps.setLong(13, record.stepUpExpiresAt());
+            }
             int rows = ps.executeUpdate();
             if (rows == 0) {
                 // Already exists — return existing

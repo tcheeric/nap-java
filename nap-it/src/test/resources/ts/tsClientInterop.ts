@@ -3,7 +3,8 @@ import { buildAuthCompleteRequest, createPrivateKeySigner } from '@imani/nap-cli
 import { hexToBytes } from '@imani/nap-core';
 
 async function main() {
-  const [baseUrl, privateKeyHex] = process.argv.slice(2);
+  const [baseUrl, privateKeyHex, stepUpArg] = process.argv.slice(2);
+  const stepUp = stepUpArg === 'step-up';
 
   if (!baseUrl || !privateKeyHex) {
     throw new Error('Usage: tsClientInterop.ts <baseUrl> <privateKeyHex>');
@@ -27,6 +28,7 @@ async function main() {
     challenge,
     signer: createPrivateKeySigner(privateKeyHex),
     createdAt: 1_710_000_000,
+    stepUp,
   });
   const completeResponse = await fetch(`${baseUrl}/auth/complete`, {
     method: 'POST',

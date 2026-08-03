@@ -58,7 +58,9 @@ public final class RegistryAclResolver implements AclResolver {
         var aclRecord = record.get();
 
         if (aclRecord.suspended()) {
-            return AclDecision.denied("suspended");
+            // The only deny this resolver is certain enough about to end the principal's
+            // sessions: the row was read, and it says suspended.
+            return AclDecision.denied("suspended", true);
         }
 
         var roleDef = registry.roles().stream()

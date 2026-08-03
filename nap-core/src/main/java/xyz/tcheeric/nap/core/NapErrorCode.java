@@ -26,6 +26,8 @@ public enum NapErrorCode {
     NAP_COMPLETE_CHALLENGE_MISMATCH(false),
     NAP_COMPLETE_PRINCIPAL_MISMATCH(false),
     NAP_COMPLETE_ACL_DENIED(false),
+    /** The challenge burned through its failure budget (RFC §13.4) — a retry cannot help. */
+    NAP_COMPLETE_FAILED_TERMINAL(false),
     NAP_COMPLETE_RATE_LIMITED(true),
     NAP_COMPLETE_INTERNAL(true);
 

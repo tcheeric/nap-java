@@ -22,10 +22,22 @@ public class NapServletFilter extends OncePerRequestFilter {
 
     public static final String RAW_BODY_ATTRIBUTE = "nap.raw.body";
 
+    /**
+     * A valid {@code /auth/complete} body is ~40 bytes. The cap (RFC §17.4) bounds what an
+     * anonymous caller can make the server buffer and hash per request.
+     */
+    public static final int DEFAULT_MAX_BODY_BYTES = 1024;
+
     private final String completePath;
+    private final int maxBodyBytes;
+
+    public NapServletFilter(String completePath, int maxBodyBytes) {
+        this.completePath = completePath;
+        this.maxBodyBytes = maxBodyBytes;
+    }
 
     public NapServletFilter(String completePath) {
-        this.completePath = completePath;
+        this(completePath, DEFAULT_MAX_BODY_BYTES);
     }
 
     public NapServletFilter() {
@@ -36,7 +48,12 @@ public class NapServletFilter extends OncePerRequestFilter {
     protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response,
                                      FilterChain filterChain) throws ServletException, IOException {
         if (request.getRequestURI().endsWith(completePath)) {
-            byte[] body = request.getInputStream().readAllBytes();
+            // Read one byte past the cap so an oversized body is detected without buffering it.
+            byte[] body = request.getInputStream().readNBytes(maxBodyBytes + 1);
+            if (body.length > maxBodyBytes) {
+                response.setStatus(HttpServletResponse.SC_REQUEST_ENTITY_TOO_LARGE);
+                return;
+            }
             request.setAttribute(RAW_BODY_ATTRIBUTE, body);
             filterChain.doFilter(new CachedBodyRequestWrapper(request, body), response);
         } else {

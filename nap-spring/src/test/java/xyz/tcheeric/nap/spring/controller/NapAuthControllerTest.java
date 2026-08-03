@@ -50,6 +50,15 @@ class NapAuthControllerTest {
             60,     // maxClockSkewSeconds
             600,    // stepUpTtlSeconds
             300,    // aclRefreshIntervalSeconds
+            null,   // rateLimitEnabled — compact ctor defaults these
+            0,      // rateLimitWindowSeconds
+            0,      // rateLimitMaxPerWindow
+            null,   // maxOutstandingChallengesPerNpub
+            null,   // maxOutstandingChallengesPerIp
+            null,   // maxFailuresPerChallenge
+            null,   // minAuthResponseMillis
+            null,   // responseJitterMillis
+            0,      // maxBodyBytes
             List.of("/internal/v1/merchants"),
             new NapProperties.CookieProperties("merchant_session", true, true, "Lax", "/", "", 43200)
     );
@@ -82,7 +91,7 @@ class NapAuthControllerTest {
                 session.roles(), session.permissions()
         ));
 
-        Object body = controller().complete(false, request, response).getBody();
+        Object body = controller().complete(request, response).getBody();
 
         var captor = forClass(VerifyCompletionInput.class);
         verify(napServer).verifyCompletion(captor.capture());
@@ -104,7 +113,7 @@ class NapAuthControllerTest {
         when(napServer.issueChallenge(any(IssueChallengeInput.class)))
                 .thenReturn(new IssueChallengeResult.Success(initResponse));
 
-        ResponseEntity<?> response = controller().init(Map.of("npub", "npub1testpubkey"));
+        ResponseEntity<?> response = controller().init(Map.of("npub", "npub1testpubkey"), new MockHttpServletRequest());
 
         assertThat(response.getStatusCode().value()).isEqualTo(200);
         assertThat(response.getBody()).isNotNull();
@@ -112,7 +121,7 @@ class NapAuthControllerTest {
 
     @Test
     void init_missingNpubAndPubkey_returnsBadRequest() {
-        ResponseEntity<?> response = controller().init(Map.of());
+        ResponseEntity<?> response = controller().init(Map.of(), new MockHttpServletRequest());
         assertThat(response.getStatusCode().value()).isEqualTo(400);
     }
 
@@ -124,7 +133,7 @@ class NapAuthControllerTest {
         request.setAttribute(NapServletFilter.RAW_BODY_ATTRIBUTE, "{}".getBytes());
         MockHttpServletResponse servletResponse = new MockHttpServletResponse();
 
-        ResponseEntity<?> response = controller().complete(false, request, servletResponse);
+        ResponseEntity<?> response = controller().complete(request, servletResponse);
 
         assertThat(response.getStatusCode().value()).isEqualTo(400);
     }
@@ -141,7 +150,7 @@ class NapAuthControllerTest {
         request.setAttribute(NapServletFilter.RAW_BODY_ATTRIBUTE, "{}".getBytes());
         MockHttpServletResponse servletResponse = new MockHttpServletResponse();
 
-        ResponseEntity<?> response = controller().complete(false, request, servletResponse);
+        ResponseEntity<?> response = controller().complete(request, servletResponse);
 
         assertThat(response.getStatusCode().value()).isEqualTo(401);
     }
@@ -196,6 +205,46 @@ class NapAuthControllerTest {
         @SuppressWarnings("unchecked")
         Map<String, Object> body = (Map<String, Object>) response.getBody();
         assertThat(body).containsEntry("reason", "expired");
+    }
+
+    @Test
+    void checkSession_returnsCrossImplementationShapeWithoutLeakingTheToken() {
+        long now = Instant.now().getEpochSecond();
+        SessionRecord active = SessionRecord.create(
+                "sid-shape", "chal-s", "token-secret",
+                "npub1example", "d".repeat(64),
+                List.of("merchant"), List.of("voucher:issue"),
+                now - 60, now - 60, now + 300, now + 43200
+        );
+        sessionStore.createForChallenge(active);
+
+        MockHttpServletRequest request = new MockHttpServletRequest("GET", "/api/v1/auth/session");
+        request.setCookies(new Cookie("merchant_session", "sid-shape"));
+
+        ResponseEntity<?> response = controller().checkSession(request);
+
+        assertThat(response.getStatusCode().value()).isEqualTo(200);
+        @SuppressWarnings("unchecked")
+        Map<String, Object> body = (Map<String, Object>) response.getBody();
+
+        // The shape @imani/nap-client-web reads: toSessionState() dereferences
+        // response.principal.pubkey, so a missing `principal` breaks resume().
+        assertThat(body).containsEntry("status", "ok");
+        assertThat(body).containsEntry("roles", List.of("merchant"));
+        assertThat(body).containsEntry("permissions", List.of("voucher:issue"));
+        @SuppressWarnings("unchecked")
+        Map<String, Object> principal = (Map<String, Object>) body.get("principal");
+        assertThat(principal).containsEntry("npub", "npub1example");
+        assertThat(principal).containsEntry("pubkey", "d".repeat(64));
+
+        // Retained for existing JVM consumers — the change is additive.
+        assertThat(body).containsEntry("pubkey", "d".repeat(64));
+        assertThat(body).containsKey("absolute_expiry_at");
+
+        // The session id is an HttpOnly cookie; echoing a credential into the body
+        // would make it readable by script.
+        assertThat(body).doesNotContainKey("access_token");
+        assertThat(body).doesNotContainKey("step_up_token");
     }
 
     @Test

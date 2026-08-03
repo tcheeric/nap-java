@@ -83,37 +83,48 @@ class TypeScriptClientInteropTest {
                 );
 
                 try {
-                    Process process = new ProcessBuilder(
-                            tsxBinary.toString(),
-                            interopScript.toString(),
-                            httpServer.baseUrl(),
-                            privateKeyHex
-                    )
-                            .directory(napRoot.toFile())
-                            .redirectErrorStream(true)
-                            .start();
-
-                    String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
-                    int exitCode = process.waitFor();
-
-                    assertThat(exitCode)
-                            .withFailMessage("TypeScript client process failed: %s", output)
-                            .isZero();
-
-                    @SuppressWarnings("unchecked")
-                    Map<String, Object> response = MAPPER.readValue(output, Map.class);
-                    assertThat(response.get("status")).isEqualTo(200);
-
-                    @SuppressWarnings("unchecked")
-                    Map<String, Object> body = (Map<String, Object>) response.get("body");
+                    Map<String, Object> body = runClient(
+                            tsxBinary, interopScript, napRoot, httpServer.baseUrl(), privateKeyHex, false);
                     assertThat(body.get("status")).isEqualTo("ok");
                     assertThat(((Map<?, ?>) body.get("principal")).get("pubkey")).isEqualTo(pubkeyHex);
                     assertThat(((Map<?, ?>) body.get("principal")).get("npub")).isEqualTo(npub);
+                    // NON_NULL: an ordinary completion must not carry the field at all.
+                    assertThat(body).doesNotContainKey("step_up_token");
+
+                    // The TS client puts step_up inside the signed body; the Java server reads it
+                    // from there. This is the assertion that fails if either side moves the flag.
+                    Map<String, Object> steppedUp = runClient(
+                            tsxBinary, interopScript, napRoot, httpServer.baseUrl(), privateKeyHex, true);
+                    assertThat(steppedUp.get("step_up_token")).isInstanceOf(String.class);
+                    assertThat((String) steppedUp.get("step_up_token")).isNotBlank();
+                    assertThat(steppedUp.get("step_up_expires_at")).isNotNull();
                 } finally {
                     Files.deleteIfExists(interopScript);
                 }
             }
         }
+    }
+
+    /** Runs the real TS client once and returns the parsed {@code /auth/complete} response body. */
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> runClient(Path tsxBinary, Path script, Path workingDir,
+                                                 String baseUrl, String privateKeyHex, boolean stepUp)
+            throws IOException, InterruptedException {
+        Process process = new ProcessBuilder(
+                tsxBinary.toString(), script.toString(), baseUrl, privateKeyHex,
+                stepUp ? "step-up" : "plain")
+                .directory(workingDir.toFile())
+                .redirectErrorStream(true)
+                .start();
+
+        String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
+        assertThat(process.waitFor())
+                .withFailMessage("TypeScript client process failed: %s", output)
+                .isZero();
+
+        Map<String, Object> response = MAPPER.readValue(output, Map.class);
+        assertThat(response.get("status")).isEqualTo(200);
+        return (Map<String, Object>) response.get("body");
     }
 
     private static final class NapHttpTestServer implements AutoCloseable {
