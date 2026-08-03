@@ -195,7 +195,12 @@ public class NapSessionFilter extends OncePerRequestFilter {
                     .toList();
         }
 
-        private static String toRoleAuthority(String role) {
+        /**
+         * Canonical role-to-authority mapping. Public so {@code NapPermissionInterceptor}
+         * resolves {@code @RequiresRole} through the same rule that populated the
+         * authorities, rather than duplicating the prefix and casing.
+         */
+        public static String toRoleAuthority(String role) {
             return "ROLE_" + role.toUpperCase();
         }
     }

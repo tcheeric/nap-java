@@ -7,9 +7,17 @@ import org.springframework.security.core.Authentication;
 import org.springframework.web.method.HandlerMethod;
 import org.springframework.web.servlet.HandlerInterceptor;
 import xyz.tcheeric.nap.spring.annotation.RequiresPermission;
+import xyz.tcheeric.nap.spring.annotation.RequiresRole;
+
+import java.util.Arrays;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 /**
- * Enforces {@link RequiresPermission} declarations on MVC handler methods.
+ * Enforces {@link RequiresPermission} and {@link RequiresRole} declarations on MVC handler
+ * methods.
+ *
+ * <p>Both are checked when both are present, and both must pass.
  */
 public class NapPermissionInterceptor implements HandlerInterceptor {
 
@@ -19,8 +27,9 @@ public class NapPermissionInterceptor implements HandlerInterceptor {
             return true;
         }
 
-        RequiresPermission annotation = findAnnotation(handlerMethod);
-        if (annotation == null) {
+        RequiresPermission permissionAnnotation = findAnnotation(handlerMethod);
+        RequiresRole roleAnnotation = findRoleAnnotation(handlerMethod);
+        if (permissionAnnotation == null && roleAnnotation == null) {
             return true;
         }
 
@@ -32,15 +41,37 @@ public class NapPermissionInterceptor implements HandlerInterceptor {
             return false;
         }
 
-        boolean allowed = authentication.getAuthorities().stream()
+        Set<String> authorities = authentication.getAuthorities().stream()
                 .map(org.springframework.security.core.GrantedAuthority::getAuthority)
-                .anyMatch(annotation.value()::equals);
-        if (allowed) {
-            return true;
+                .collect(Collectors.toSet());
+
+        if (permissionAnnotation != null && !authorities.contains(permissionAnnotation.value())) {
+            response.setStatus(HttpServletResponse.SC_FORBIDDEN);
+            return false;
         }
 
-        response.setStatus(HttpServletResponse.SC_FORBIDDEN);
-        return false;
+        if (roleAnnotation != null) {
+            // NapAuthenticationToken maps roles to ROLE_<UPPER> authorities.
+            boolean allowed = Arrays.stream(roleAnnotation.value())
+                    .map(NapSessionFilter.NapAuthenticationToken::toRoleAuthority)
+                    .anyMatch(authorities::contains);
+            if (!allowed) {
+                response.setStatus(HttpServletResponse.SC_FORBIDDEN);
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private RequiresRole findRoleAnnotation(HandlerMethod handlerMethod) {
+        RequiresRole methodAnnotation = AnnotatedElementUtils.findMergedAnnotation(
+                handlerMethod.getMethod(), RequiresRole.class);
+        if (methodAnnotation != null) {
+            return methodAnnotation;
+        }
+        return AnnotatedElementUtils.findMergedAnnotation(
+                handlerMethod.getBeanType(), RequiresRole.class);
     }
 
     private RequiresPermission findAnnotation(HandlerMethod handlerMethod) {

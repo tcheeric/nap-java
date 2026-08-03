@@ -17,6 +17,8 @@ import xyz.tcheeric.nap.spring.filter.NapServletFilter;
 
 import java.time.Instant;
 import java.util.Arrays;
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -141,11 +143,25 @@ public class NapAuthController {
         long newExpiresAt = Math.min(now + idleTtl, record.absoluteExpiryAt());
         sessionStore.touch(record.sessionId(), now, newExpiresAt);
 
-        return ResponseEntity.ok(Map.of(
-                "pubkey", record.principalPubkey(),
-                "expires_at", newExpiresAt,
-                "absolute_expiry_at", record.absoluteExpiryAt()
-        ));
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("status", "ok");
+        // `principal`, `roles` and `permissions` are the cross-implementation shape the
+        // browser client reads (toSessionState reads response.principal.pubkey). `pubkey`
+        // is retained alongside it so existing JVM consumers keep working — an additive
+        // change rather than a rename.
+        body.put("pubkey", record.principalPubkey());
+        Map<String, Object> principal = new LinkedHashMap<>();
+        principal.put("npub", record.principalNpub());
+        principal.put("pubkey", record.principalPubkey());
+        body.put("principal", principal);
+        body.put("roles", record.roles() == null ? List.of() : record.roles());
+        body.put("permissions", record.permissions() == null ? List.of() : record.permissions());
+        body.put("expires_at", newExpiresAt);
+        body.put("absolute_expiry_at", record.absoluteExpiryAt());
+
+        // Deliberately no access_token: the session id lives in an HttpOnly cookie, and
+        // echoing a credential into a JSON body would make it readable by script.
+        return ResponseEntity.ok(body);
     }
 
     @PostMapping("/logout")
