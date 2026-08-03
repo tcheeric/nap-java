@@ -7,9 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Wire and behavioural parity with the TypeScript workspace's unreleased security
-hardening. A TS client asking for a step-up, or reading a 429, now works against a
-Java server; before this it did not.
+## [0.3.0] - 2026-08-03
+
+Wire and behavioural parity with the TypeScript workspace's 0.4.0 security hardening.
+A TS client asking for a step-up, or reading a 429, now works against a Java server;
+before this it did not.
 
 ### Added
 
@@ -186,6 +188,7 @@ Java server; before this it did not.
 Initial published release of the Java NAP v2 implementation: `nap-core`, `nap-server`,
 `nap-jdbc`, `nap-client`, `nap-spring`, and the `nap-it` integration suite.
 
-[Unreleased]: https://github.com/tcheeric/nap-java/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/tcheeric/nap-java/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/tcheeric/nap-java/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/tcheeric/nap-java/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/tcheeric/nap-java/releases/tag/v0.1.1
