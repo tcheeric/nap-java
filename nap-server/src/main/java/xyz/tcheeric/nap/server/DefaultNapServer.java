@@ -39,7 +39,13 @@ final class DefaultNapServer implements NapServer {
             // well-formed calls cannot be the denominator for the failure rate.
             count(NapCounter.AUTH_INIT_TOTAL);
             result = issueChallengeUnpadded(input);
-            countOutcome(result instanceof IssueChallengeResult.Failure f ? f.code() : null);
+            // Only the failure side. Issuing a challenge is not an authentication, and counting
+            // it in auth_success_total would make that counter "inits + completions" here and
+            // "completions" in the TypeScript implementation — the same §19.3 name measuring
+            // two different things.
+            if (result instanceof IssueChallengeResult.Failure f) {
+                countOutcome(f.code());
+            }
             return result;
         } finally {
             if (!isRateLimited(result, NapErrorCode.NAP_INIT_RATE_LIMITED)) {
@@ -358,6 +364,14 @@ final class DefaultNapServer implements NapServer {
         }
 
         if (session.refreshExpiresAt() == null || session.refreshExpiresAt() < now) {
+            return RefreshSessionOutcome.failure(NapErrorCode.NAP_REFRESH_EXPIRED);
+        }
+
+        // The absolute cap ends the session, not just its current access token. Without this the
+        // clamp below would hand back an expires_at already in the past — a 200 carrying a dead
+        // token — and since every rotation re-arms refresh_expires_at, the family would outlive
+        // the cap indefinitely.
+        if (session.absoluteExpiryAt() <= now) {
             return RefreshSessionOutcome.failure(NapErrorCode.NAP_REFRESH_EXPIRED);
         }
 

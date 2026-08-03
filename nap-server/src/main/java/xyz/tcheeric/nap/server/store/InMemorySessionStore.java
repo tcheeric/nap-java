@@ -92,6 +92,10 @@ public final class InMemorySessionStore implements SessionStore {
         var superseded = new SessionRecord[1];
 
         var rotated = bySessionId.computeIfPresent(sessionId, (key, existing) -> {
+            // Revocation is part of the compare-and-swap, matching `AND revoked_at IS NULL` in
+            // JdbcSessionStore: a revoke landing between the server's check and this call must
+            // lose here too, or the two stores disagree under exactly the race the CAS exists for.
+            if (existing.revokedAt() != null) return existing;
             if (!params.expectedRefreshToken().equals(existing.refreshToken())) return existing;
             superseded[0] = existing;
             return existing.withRotatedRefresh(params);

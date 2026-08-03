@@ -4,6 +4,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import xyz.tcheeric.nap.core.AclDecision;
 import xyz.tcheeric.nap.core.NapErrorCode;
+import xyz.tcheeric.nap.core.RotateRefreshTokenParams;
 import xyz.tcheeric.nap.core.SessionRecord;
 import xyz.tcheeric.nap.core.SessionStore;
 import xyz.tcheeric.nap.server.store.InMemoryChallengeStore;
@@ -125,6 +126,43 @@ class RefreshSessionTest {
         clock.set(T0 + 61);
         assertThat(failure(server.refreshSession(new RefreshSessionInput("refresh-1", "1.2.3.4"))).code())
                 .isEqualTo(NapErrorCode.NAP_REFRESH_EXPIRED);
+    }
+
+    /**
+     * The absolute cap ends the session itself. Without the guard the clamp would return an
+     * expires_at already in the past — a 200 carrying a dead access token — and each rotation
+     * would re-arm refresh_expires_at, so the family would outlive the cap forever.
+     */
+    @Test
+    void refusesOnceTheAbsoluteCapHasPassed() {
+        store.createForChallenge(record("sess-1", "chal-1", "access-1", "refresh-1",
+                T0 + 86400, T0 + 900, T0 + 120, null));
+        NapServer server = server(store, 3600);
+
+        clock.set(T0 + 121);
+        var outcome = server.refreshSession(new RefreshSessionInput("refresh-1", "1.2.3.4"));
+
+        assertThat(failure(outcome).code()).isEqualTo(NapErrorCode.NAP_REFRESH_EXPIRED);
+        assertThat(store.getByRefreshToken("refresh-1"))
+                .hasValueSatisfying(s -> assertThat(s.refreshToken()).isEqualTo("refresh-1"));
+    }
+
+    /**
+     * The store's compare-and-swap refuses a revoked row on its own, matching
+     * {@code AND revoked_at IS NULL} in JdbcSessionStore — the server's own check happens
+     * earlier and cannot cover a revoke that lands during the refresh.
+     */
+    @Test
+    void rotationLosesToARevokeThatLandsMidRefresh() {
+        SessionRecord seeded = seed("refresh-1", T0 + 3600);
+        store.revokeBySessionId("sess-1", T0 + 5);
+
+        var rotated = store.rotateRefreshToken("sess-1", new RotateRefreshTokenParams(
+                "refresh-1", "access-2", "refresh-2", T0 + 10, T0 + 910, T0 + 3610,
+                seeded.roles(), seeded.permissions()));
+
+        assertThat(rotated).isEmpty();
+        assertThat(store.getByRefreshToken("refresh-2")).isEmpty();
     }
 
     @Test

@@ -169,9 +169,15 @@ public class NapAuthController {
                     rateLimited(f.retryAfterSeconds());
             case RefreshSessionOutcome.Failure f -> {
                 log.warn("nap_refresh_failed code={}", f.code());
+                // Deliberately does *not* clear the cookie. This endpoint needs no cookie and no
+                // Authorization header to reach this branch, so clearing here would let any
+                // cross-site POST to /auth/refresh log out every visitor holding a live session
+                // — and even same-origin it would end a session whose access token was fine
+                // just because the client presented a stale refresh token. Only /auth/logout
+                // and an explicitly ended session clear it.
+                //
                 // The same uniform 401 as a failed completion, for the same reason: which
                 // check failed is the attacker's question, not the client's.
-                clearCookie(response);
                 yield ResponseEntity.status(HttpStatus.UNAUTHORIZED)
                         .body(napServer.toPublicAuthFailure().body());
             }

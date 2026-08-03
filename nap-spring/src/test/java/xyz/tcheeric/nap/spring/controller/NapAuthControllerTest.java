@@ -9,11 +9,14 @@ import org.springframework.mock.web.MockHttpServletResponse;
 import xyz.tcheeric.nap.core.AuthFailureResponse;
 import xyz.tcheeric.nap.core.AuthInitResponse;
 import xyz.tcheeric.nap.core.AuthSuccessResponse;
+import xyz.tcheeric.nap.core.NapErrorCode;
 import xyz.tcheeric.nap.core.SessionRecord;
 import xyz.tcheeric.nap.core.SessionStore;
 import xyz.tcheeric.nap.server.IssueChallengeInput;
 import xyz.tcheeric.nap.server.IssueChallengeResult;
 import xyz.tcheeric.nap.server.NapServer;
+import xyz.tcheeric.nap.server.RefreshSessionInput;
+import xyz.tcheeric.nap.server.RefreshSessionOutcome;
 import xyz.tcheeric.nap.server.VerifyCompletionInput;
 import xyz.tcheeric.nap.server.VerifyCompletionOutcome;
 import xyz.tcheeric.nap.server.store.InMemorySessionStore;
@@ -309,6 +312,66 @@ class NapAuthControllerTest {
         Map<String, Object> body = (Map<String, Object>) response.getBody();
         long newExpiresAt = ((Number) body.get("expires_at")).longValue();
         assertThat(newExpiresAt).isEqualTo(absoluteExpiry);
+    }
+
+    // -----------------------------------------------------------------
+    // /auth/refresh
+    // -----------------------------------------------------------------
+
+    /**
+     * A failed refresh must leave the session cookie alone. The endpoint needs neither a cookie
+     * nor an Authorization header to reach the failure branch, so clearing there would let any
+     * cross-site POST to /auth/refresh log out every visitor holding a live session.
+     */
+    @Test
+    void refresh_failure_returns401ButLeavesTheSessionCookieAlone() {
+        when(napServer.refreshSession(any()))
+                .thenReturn(RefreshSessionOutcome.failure(NapErrorCode.NAP_REFRESH_UNKNOWN_TOKEN));
+        when(napServer.toPublicAuthFailure())
+                .thenReturn(new NapServer.PublicFailureResponse(401, AuthFailureResponse.authenticationFailed()));
+
+        MockHttpServletRequest request = new MockHttpServletRequest("POST", "/api/v1/auth/refresh");
+        request.setCookies(new Cookie("merchant_session", "sid-live"));
+        MockHttpServletResponse response = new MockHttpServletResponse();
+
+        ResponseEntity<?> result = controller().refresh(request, response);
+
+        assertThat(result.getStatusCode().value()).isEqualTo(401);
+        assertThat(response.getCookie("merchant_session")).isNull();
+    }
+
+    @Test
+    void refresh_success_renewsTheCookie() {
+        long now = Instant.now().getEpochSecond();
+        SessionRecord rotated = SessionRecord.create(
+                "sid-rotated", "chal-r", "access-2",
+                "npub-r", "f".repeat(64),
+                List.of("merchant"), List.of("read"),
+                now - 60, now, now + 900, now + 43200
+        );
+        when(napServer.refreshSession(any())).thenReturn(new RefreshSessionOutcome.Success(rotated));
+        when(napServer.toPublicAuthSuccess(rotated)).thenReturn(new AuthSuccessResponse(
+                "ok", rotated.accessToken(), "Bearer",
+                rotated.expiresAt(), rotated.absoluteExpiryAt(),
+                new AuthSuccessResponse.Principal(rotated.principalNpub(), rotated.principalPubkey()),
+                rotated.roles(), rotated.permissions()
+        ));
+
+        MockHttpServletRequest request = new MockHttpServletRequest("POST", "/api/v1/auth/refresh");
+        request.addHeader("Authorization", "Bearer refresh-1");
+        MockHttpServletResponse response = new MockHttpServletResponse();
+
+        ResponseEntity<?> result = controller().refresh(request, response);
+
+        assertThat(result.getStatusCode().value()).isEqualTo(200);
+        Cookie cookie = response.getCookie("merchant_session");
+        assertThat(cookie).isNotNull();
+        assertThat(cookie.getValue()).isEqualTo("sid-rotated");
+        assertThat(cookie.getMaxAge()).isEqualTo(43200);
+
+        var captor = forClass(RefreshSessionInput.class);
+        verify(napServer).refreshSession(captor.capture());
+        assertThat(captor.getValue().refreshToken()).isEqualTo("refresh-1");
     }
 
     // -----------------------------------------------------------------
