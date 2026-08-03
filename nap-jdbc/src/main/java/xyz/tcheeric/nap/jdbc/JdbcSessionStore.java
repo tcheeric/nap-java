@@ -20,26 +20,17 @@ import java.util.Optional;
 /**
  * PostgreSQL-backed SessionStore using plain JDBC.
  *
- * <p>Spec 006 adds two columns to {@code nap_sessions}:
- * <pre>
- *   ALTER TABLE nap_sessions ADD COLUMN last_activity_at    BIGINT NOT NULL DEFAULT 0;
- *   ALTER TABLE nap_sessions ADD COLUMN absolute_expiry_at  BIGINT NOT NULL DEFAULT 0;
- *   UPDATE nap_sessions SET last_activity_at = issued_at,
- *                           absolute_expiry_at = expires_at
- *     WHERE last_activity_at = 0 OR absolute_expiry_at = 0;
- * </pre>
- * Consumers own their schema — apply this migration before deploying a NAP
- * server that reads/writes these columns.
+ * <p>The schema this class expects is {@code V1__create_nap_tables.sql} through
+ * {@code V3__sliding_window_and_refresh_tokens.sql} in {@code db/migration}. V3 carries the
+ * spec 006 sliding-window columns ({@code last_activity_at}, {@code absolute_expiry_at}) and
+ * the RFC §14.1 refresh columns ({@code refresh_token}, {@code refresh_expires_at},
+ * {@code previous_refresh_token}); before it existed, both sets lived only in this comment,
+ * and a database built from V1 and V2 alone could neither accept an insert from this store
+ * nor be mapped by it.
  *
- * <p>Refresh tokens (RFC §14.1) add three more:
- * <pre>
- *   ALTER TABLE nap_sessions ADD COLUMN refresh_token          TEXT UNIQUE;
- *   ALTER TABLE nap_sessions ADD COLUMN refresh_expires_at     BIGINT;
- *   ALTER TABLE nap_sessions ADD COLUMN previous_refresh_token TEXT;
- *   CREATE INDEX idx_nap_sessions_refresh_token      ON nap_sessions (refresh_token);
- *   CREATE INDEX idx_nap_sessions_prev_refresh_token ON nap_sessions (previous_refresh_token);
- * </pre>
- * Only needed when {@code refreshTtlSeconds} is configured.
+ * <p>Consumers own their schema. Apply every migration through V3 before deploying — the
+ * refresh columns are needed even when {@code refreshTtlSeconds} is unset, because the
+ * INSERT always lists them.
  */
 public final class JdbcSessionStore implements SessionStore {
 
