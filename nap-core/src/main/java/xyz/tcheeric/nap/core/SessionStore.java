@@ -28,4 +28,41 @@ public interface SessionStore {
      * @param newExpiresAt         unix-seconds; typically {@code min(now + idleTtl, absoluteExpiryAt)}
      */
     void touch(String sessionId, long newLastActivityAt, long newExpiresAt);
+
+    /**
+     * Look up a session by either its current <em>or</em> its previous refresh token
+     * (RFC §14.1). Both, deliberately: returning nothing for a retired token would make a
+     * replay indistinguishable from a made-up one, and the whole point of rotation is that
+     * the difference is detectable. Revoked rows must still be returned for the same
+     * reason.
+     *
+     * <p>Defaults to empty so stores written before refresh tokens keep compiling. Leaving
+     * it unimplemented means {@code refreshTtlSeconds} cannot be configured — the server
+     * refuses to start rather than serve a {@code /auth/refresh} that always fails.
+     */
+    default Optional<SessionRecord> getByRefreshToken(String refreshToken) {
+        return Optional.empty();
+    }
+
+    /**
+     * Swap in a new access and refresh token on an existing session, retaining the outgoing
+     * refresh token as {@code previousRefreshToken}. Returns the updated record, or empty if
+     * the session is gone or no longer holds
+     * {@link RotateRefreshTokenParams#expectedRefreshToken}.
+     *
+     * <p>Rotation stays on the one row: the row <em>is</em> the token family, so revoking it
+     * on a replay revokes the lineage without a separate family table.
+     */
+    default Optional<SessionRecord> rotateRefreshToken(String sessionId, RotateRefreshTokenParams params) {
+        return Optional.empty();
+    }
+
+    /**
+     * Whether this store can back {@code /auth/refresh}. Both methods above default to a
+     * no-op, so a store that implements neither would otherwise mint refresh tokens that
+     * every refresh then rejects.
+     */
+    default boolean supportsRefreshTokens() {
+        return false;
+    }
 }

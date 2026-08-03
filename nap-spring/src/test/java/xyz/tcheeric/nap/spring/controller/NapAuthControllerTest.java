@@ -49,6 +49,7 @@ class NapAuthControllerTest {
             30,     // resultCacheTtlSeconds
             60,     // maxClockSkewSeconds
             600,    // stepUpTtlSeconds
+            0,      // refreshTtlSeconds — refresh is opt-in
             300,    // aclRefreshIntervalSeconds
             null,   // rateLimitEnabled — compact ctor defaults these
             0,      // rateLimitWindowSeconds

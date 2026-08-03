@@ -1,5 +1,6 @@
 package xyz.tcheeric.nap.server.store;
 
+import xyz.tcheeric.nap.core.RotateRefreshTokenParams;
 import xyz.tcheeric.nap.core.SessionRecord;
 import xyz.tcheeric.nap.core.SessionStore;
 
@@ -14,6 +15,8 @@ public final class InMemorySessionStore implements SessionStore {
     private final ConcurrentHashMap<String, SessionRecord> bySessionId = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, SessionRecord> byAccessToken = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, SessionRecord> byChallengeId = new ConcurrentHashMap<>();
+    /** Holds both the current and the previous refresh token — see {@link #getByRefreshToken}. */
+    private final ConcurrentHashMap<String, SessionRecord> byRefreshToken = new ConcurrentHashMap<>();
 
     @Override
     public SessionRecord createForChallenge(SessionRecord record) {
@@ -23,6 +26,9 @@ public final class InMemorySessionStore implements SessionStore {
         }
         bySessionId.put(record.sessionId(), record);
         byAccessToken.put(record.accessToken(), record);
+        if (record.refreshToken() != null) {
+            byRefreshToken.put(record.refreshToken(), record);
+        }
         return record;
     }
 
@@ -42,15 +48,8 @@ public final class InMemorySessionStore implements SessionStore {
     public void revokeBySessionId(String sessionId, long nowUnix) {
         bySessionId.computeIfPresent(sessionId, (key, existing) -> {
             if (existing.revokedAt() != null) return existing;
-            var revoked = new SessionRecord(
-                    existing.sessionId(), existing.challengeId(), existing.accessToken(),
-                    existing.principalNpub(), existing.principalPubkey(),
-                    existing.roles(), existing.permissions(),
-                    existing.issuedAt(), existing.lastActivityAt(),
-                    existing.expiresAt(), existing.absoluteExpiryAt(), nowUnix,
-                    existing.stepUpToken(), existing.stepUpExpiresAt()
-            );
-            byAccessToken.put(existing.accessToken(), revoked);
+            var revoked = existing.withRevokedAt(nowUnix);
+            reindex(revoked);
             return revoked;
         });
     }
@@ -74,22 +73,65 @@ public final class InMemorySessionStore implements SessionStore {
             if (existing.absoluteExpiryAt() <= newLastActivityAt) return existing;
             // Never extend past the absolute cap, even if the caller asks us to.
             long clampedExpiresAt = Math.min(newExpiresAt, existing.absoluteExpiryAt());
-            var touched = new SessionRecord(
-                    existing.sessionId(), existing.challengeId(), existing.accessToken(),
-                    existing.principalNpub(), existing.principalPubkey(),
-                    existing.roles(), existing.permissions(),
-                    existing.issuedAt(), newLastActivityAt,
-                    clampedExpiresAt, existing.absoluteExpiryAt(), existing.revokedAt(),
-                    existing.stepUpToken(), existing.stepUpExpiresAt()
-            );
-            byAccessToken.put(existing.accessToken(), touched);
+            var touched = existing.withSlidingWindow(newLastActivityAt, clampedExpiresAt);
+            reindex(touched);
             return touched;
         });
+    }
+
+    /** Deliberately no revoked filter: a replay on a revoked session must stay visible. */
+    @Override
+    public Optional<SessionRecord> getByRefreshToken(String refreshToken) {
+        return Optional.ofNullable(byRefreshToken.get(refreshToken));
+    }
+
+    @Override
+    public Optional<SessionRecord> rotateRefreshToken(String sessionId, RotateRefreshTokenParams params) {
+        // Captured inside the atomic swap so a concurrent rotation cannot make us evict
+        // tokens the winner still recognises.
+        var superseded = new SessionRecord[1];
+
+        var rotated = bySessionId.computeIfPresent(sessionId, (key, existing) -> {
+            if (!params.expectedRefreshToken().equals(existing.refreshToken())) return existing;
+            superseded[0] = existing;
+            return existing.withRotatedRefresh(params);
+        });
+
+        if (superseded[0] == null || rotated == null) {
+            return Optional.empty();
+        }
+
+        // The token two rotations back stops being recognisable here. That is the intended
+        // bound: whoever rotated past it already answered for it.
+        if (superseded[0].previousRefreshToken() != null) {
+            byRefreshToken.remove(superseded[0].previousRefreshToken());
+        }
+        byAccessToken.remove(superseded[0].accessToken());
+        reindex(rotated);
+        return Optional.of(rotated);
+    }
+
+    @Override
+    public boolean supportsRefreshTokens() {
+        return true;
+    }
+
+    /** Point every secondary index at the new immutable copy of the session. */
+    private void reindex(SessionRecord record) {
+        byAccessToken.put(record.accessToken(), record);
+        byChallengeId.put(record.challengeId(), record);
+        if (record.refreshToken() != null) {
+            byRefreshToken.put(record.refreshToken(), record);
+        }
+        if (record.previousRefreshToken() != null) {
+            byRefreshToken.put(record.previousRefreshToken(), record);
+        }
     }
 
     public void clear() {
         bySessionId.clear();
         byAccessToken.clear();
         byChallengeId.clear();
+        byRefreshToken.clear();
     }
 }

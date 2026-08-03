@@ -18,11 +18,14 @@ import xyz.tcheeric.nap.server.AllowAllAclResolver;
 import xyz.tcheeric.nap.server.EventReplayGuard;
 import xyz.tcheeric.nap.server.NapServer;
 import xyz.tcheeric.nap.server.NapServerOptions;
+import xyz.tcheeric.nap.server.MetricsRecorder;
 import xyz.tcheeric.nap.server.RateLimiter;
 import xyz.tcheeric.nap.server.InMemoryRateLimiter;
 import xyz.tcheeric.nap.server.acl.PermissionRegistry;
 import xyz.tcheeric.nap.server.store.InMemoryChallengeStore;
 import xyz.tcheeric.nap.server.store.InMemorySessionStore;
+import xyz.tcheeric.nap.spring.AudienceResolver;
+import xyz.tcheeric.nap.spring.RawBodyExtractor;
 import xyz.tcheeric.nap.spring.controller.NapAuthController;
 import xyz.tcheeric.nap.spring.filter.NapPermissionInterceptor;
 
@@ -58,7 +61,8 @@ public class NapAutoConfiguration {
                                AclResolver aclResolver,
                                NapProperties properties,
                                ObjectProvider<EventReplayGuard> replayGuardProvider,
-                               ObjectProvider<RateLimiter> rateLimiterProvider) {
+                               ObjectProvider<RateLimiter> rateLimiterProvider,
+                               ObjectProvider<MetricsRecorder> metricsProvider) {
         return NapServer.create(NapServerOptions.builder()
                 .challengeStore(challengeStore)
                 .sessionStore(sessionStore)
@@ -81,7 +85,9 @@ public class NapAutoConfiguration {
                 .sessionAbsoluteTtlSeconds(properties.sessionAbsoluteTtlSeconds())
                 .resultCacheTtlSeconds(properties.resultCacheTtlSeconds())
                 .maxClockSkewSeconds(properties.maxClockSkewSeconds())
+                .metrics(metricsProvider.getIfAvailable())
                 .stepUpTtlSeconds(properties.stepUpTtlSeconds())
+                .refreshTtlSeconds(properties.refreshTtlSeconds())
                 .maxOutstandingChallengesPerNpub(properties.maxOutstandingChallengesPerNpub())
                 .maxOutstandingChallengesPerIp(properties.maxOutstandingChallengesPerIp())
                 .maxFailuresPerChallenge(properties.maxFailuresPerChallenge())
@@ -99,8 +105,14 @@ public class NapAutoConfiguration {
     @ConditionalOnMissingBean
     public NapAuthController napAuthController(NapServer napServer, SessionStore sessionStore,
                                                NapProperties properties,
-                                               com.fasterxml.jackson.databind.ObjectMapper objectMapper) {
-        return new NapAuthController(napServer, sessionStore, properties, objectMapper);
+                                               com.fasterxml.jackson.databind.ObjectMapper objectMapper,
+                                               ObjectProvider<AudienceResolver> audienceResolverProvider,
+                                               ObjectProvider<RawBodyExtractor> rawBodyExtractorProvider) {
+        // Both null unless the application supplies one; nap.external-base-url stays the
+        // shorthand for the common case (RFC §20.2).
+        return new NapAuthController(napServer, sessionStore, properties, objectMapper,
+                audienceResolverProvider.getIfAvailable(),
+                rawBodyExtractorProvider.getIfAvailable());
     }
 
     @Bean

@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Parity with the TypeScript workspace's Unreleased section — refresh tokens, metrics, and
+the official test vectors.
+
+### Added
+
+- **Rotating refresh tokens** (RFC §14.1). Set `refreshTtlSeconds` and the completion
+  response carries `refresh_token` / `refresh_expires_at`, and `NapAuthController`
+  registers `POST /api/v1/auth/refresh`. The token is read from `Authorization: Bearer`,
+  never a cookie — a cookie would be attached by the browser to every request to the
+  origin, which is what a long-lived credential must not be. Each call mints a new access
+  *and* refresh token and retires the presented one.
+
+  **Presenting a retired token revokes the session.** `SessionRecord` keeps one step of
+  history (`previousRefreshToken`), which makes a replay distinguishable from a made-up
+  token; the response is `NAP_REFRESH_REUSED`, returned after the revocation. A stolen
+  token therefore buys one rotation and costs the legitimate holder their session — the
+  theft becomes visible instead of silent.
+
+  The ACL is re-resolved on every refresh: a refresh mints a full-TTL access token, so
+  trusting the login-time snapshot would let a suspended principal extend access
+  indefinitely. As elsewhere, only a denial carrying `revokeSessions` ends every session.
+  Unlike the TypeScript implementation, the rotated session is still clamped to the
+  absolute expiry it was created with (spec 006) — a refresh slides the idle window and
+  cannot push a session past its absolute cap.
+
+  Off unless configured. `SessionStore.getByRefreshToken`, `rotateRefreshToken` and
+  `supportsRefreshTokens` are `default` members so existing stores keep compiling, but
+  `NapServerOptions.build()` **throws** if `refreshTtlSeconds` is set against a store
+  lacking them, rather than mint credentials nothing can honour. `JdbcSessionStore` needs
+  three new columns and two indexes — see its DDL javadoc.
+- **`MetricsRecorder`** (RFC §19.3, §20.2). A pluggable, no-op-by-default
+  `{ increment(NapCounter) }`, incrementing the ten RFC-named counters — the same metric
+  names as the TypeScript side, so one dashboard covers both. Supply a bean and
+  auto-configuration wires it. There being no `AuditLogger` on this side, the counters are
+  incremented at the outcome points in `DefaultNapServer`; a recorder that throws is
+  swallowed, since a metrics outage must not fail a login.
+- **Official NAP v2 test vectors** (RFC §20.3) are now run against this implementation by
+  `OfficialTestVectorsTest`, reading the fixtures generated in the TypeScript repository.
+  Error codes are part of each vector, so a divergence between the two implementations
+  shows up as a failing case rather than as a mapping in a consumer. Skipped when the
+  sibling checkout is absent; `-Dnap.test-vectors.dir` points it elsewhere.
+- **`AudienceResolver` and `RawBodyExtractor`** (RFC §20.2), both accepted by
+  `NapAuthController` as optional beans. `nap.external-base-url` stays the documented
+  shorthand for the common case.
+
 ## [0.3.0] - 2026-08-03
 
 Wire and behavioural parity with the TypeScript workspace's 0.4.0 security hardening.
