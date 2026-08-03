@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-04
+
 Parity with the TypeScript workspace's Unreleased section — refresh tokens, metrics, and
 the official test vectors.
 
@@ -36,7 +38,7 @@ the official test vectors.
   `supportsRefreshTokens` are `default` members so existing stores keep compiling, but
   `NapServerOptions.build()` **throws** if `refreshTtlSeconds` is set against a store
   lacking them, rather than mint credentials nothing can honour. `JdbcSessionStore` needs
-  three new columns and two indexes — see its DDL javadoc.
+  three new columns and two indexes, created by `V3__sliding_window_and_refresh_tokens.sql`.
 - **`MetricsRecorder`** (RFC §19.3, §20.2). A pluggable, no-op-by-default
   `{ increment(NapCounter) }`, incrementing the ten RFC-named counters — the same metric
   names as the TypeScript side, so one dashboard covers both. Supply a bean and
@@ -51,6 +53,52 @@ the official test vectors.
 - **`AudienceResolver` and `RawBodyExtractor`** (RFC §20.2), both accepted by
   `NapAuthController` as optional beans. `nap.external-base-url` stays the documented
   shorthand for the common case.
+
+### Security
+
+- **Authentication bypass in NIP-98 verification — every release through 0.3.0 is
+  affected.** `Nip98Validator` read `event.id` from the caller-supplied header and
+  Schnorr-verified over those bytes without recomputing it from
+  `sha256([0, pubkey, created_at, kind, tags, content])`. The signature therefore proved
+  only that the key had signed *some* event, not the one presented. Any event the victim
+  had ever published to a relay — a kind-1 note suffices — could have its `id`, `pubkey`
+  and `sig` kept and every other field rewritten into a completion for a challenge
+  `/auth/init` will issue for any npub on request. **No private key needed**; confirmed
+  against a running server before the fix. Now recomputes the canonical NIP-01
+  serialization and compares with `MessageDigest.isEqual` before verifying;
+  `SignatureBindingTest` forges exactly that event and requires
+  `NAP_COMPLETE_INVALID_SIGNATURE`. The TypeScript implementation was never affected —
+  `nostr-tools`' `verifyEvent()` recomputes the id and rejects a mismatch. Wire format is
+  unchanged, so upgrading is a drop-in.
+- **`POST /auth/refresh` no longer clears the session cookie when it fails.** That branch
+  needs neither a cookie nor an `Authorization` header to reach, so any unauthenticated
+  cross-site POST to it logged out every visitor holding a live session; same-origin, it
+  ended a session whose access token was fine because the client presented a stale refresh
+  token. Only `/auth/logout` and an explicitly ended session clear it now.
+
+### Fixed
+
+- **`JdbcSessionStore` used five columns no migration created.** `last_activity_at` and
+  `absolute_expiry_at` (spec 006) and the three refresh columns existed only as DDL in a
+  class javadoc, so a database built from the published `V1` + `V2` could neither accept an
+  insert from the store nor have a row mapped by it. `V3__sliding_window_and_refresh_tokens.sql`
+  creates all five plus the refresh indexes and backfills the sliding-window pair from
+  `issued_at` / `expires_at`. `refresh_token` gets a **partial UNIQUE** index: two sessions
+  sharing a token would make `getByRefreshToken` ambiguous and break the rotation
+  compare-and-swap. Every test passed throughout, because they all use the in-memory store.
+- **A session past `absolute_expiry_at` could refresh forever.** The refresh path checked
+  `refresh_expires_at` but not the absolute cap, so past it the clamp returned an
+  `expires_at` already in the past — a 200 carrying a dead access token — and since every
+  rotation re-arms `refresh_expires_at`, the family outlived the cap indefinitely. Now
+  `NAP_REFRESH_EXPIRED`.
+- **`auth_success_total` no longer counts a successful `/auth/init`.** Issuing a challenge
+  is not an authentication, and the TypeScript side emits no success event for it — the
+  same §19.3 counter name meant "inits + completions" here and "completions" there, so any
+  failure rate derived from it depended on which implementation answered.
+- **`InMemorySessionStore`'s rotation compare-and-swap now includes revocation**, matching
+  `AND revoked_at IS NULL` in `JdbcSessionStore`. A revoke landing between the server's
+  check and the swap won on one store and lost on the other — exactly the race the CAS
+  exists for.
 
 ## [0.3.0] - 2026-08-03
 
