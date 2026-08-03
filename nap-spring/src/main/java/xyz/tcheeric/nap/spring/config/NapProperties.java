@@ -15,6 +15,11 @@ public record NapProperties(
         int resultCacheTtlSeconds,
         int maxClockSkewSeconds,
         int stepUpTtlSeconds,
+        // RFC §14.1. Unset (0) means no refresh tokens are issued and
+        // POST /api/v1/auth/refresh answers every call the same way it answers an unknown
+        // token — refresh is opt-in, since it trades a longer-lived credential for fewer
+        // NIP-98 signing prompts and only the deployment knows whether it wants that.
+        int refreshTtlSeconds,
         int aclRefreshIntervalSeconds,
         Boolean rateLimitEnabled,
         int rateLimitWindowSeconds,

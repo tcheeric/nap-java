@@ -2,6 +2,7 @@ package xyz.tcheeric.nap.core;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
 import nostr.crypto.schnorr.Schnorr;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -201,6 +202,19 @@ public final class Nip98Validator {
         }
     }
 
+    /**
+     * The id is <em>recomputed</em> before the signature is checked, never trusted as presented.
+     *
+     * <p>Verifying a signature over the id the caller supplied proves only that the key signed
+     * <em>some</em> event. Every other field — the {@code u}, {@code payload}, {@code challenge}
+     * and {@code challenge_id} tags included — is read from the same caller-supplied JSON, so
+     * without this check any note the victim ever published could be re-dressed as a completion
+     * for a challenge the attacker opened, and the signature would still verify. Recomputing is
+     * what binds the signature to the fields the rest of this validator inspects.
+     *
+     * <p>Matches {@code verifyEvent()} in {@code nostr-tools}, which the TypeScript
+     * implementation relies on for the same check.
+     */
     static boolean verifySignature(Nip98Event event) {
         try {
             byte[] message = HEX.parseHex(event.id());
@@ -211,11 +225,37 @@ public final class Nip98Validator {
                 return false;
             }
 
+            if (!MessageDigest.isEqual(message, computeEventId(event))) {
+                log.debug("Event id does not match the canonical serialization");
+                return false;
+            }
+
             return Schnorr.verify(message, publicKey, signature);
         } catch (Exception e) {
             log.debug("Signature verification failed: {}", e.getMessage());
             return false;
         }
+    }
+
+    /**
+     * {@code sha256(utf8([0, pubkey, created_at, kind, tags, content]))} — the NIP-01 canonical
+     * serialization, compact and in this exact field order.
+     */
+    private static byte[] computeEventId(Nip98Event event) throws Exception {
+        ArrayNode serialized = OBJECT_MAPPER.createArrayNode();
+        serialized.add(0);
+        serialized.add(event.pubkey());
+        serialized.add(event.createdAt());
+        serialized.add(event.kind());
+        ArrayNode tags = serialized.addArray();
+        for (List<String> tag : event.tags()) {
+            ArrayNode element = tags.addArray();
+            tag.forEach(element::add);
+        }
+        serialized.add(event.content());
+
+        return MessageDigest.getInstance("SHA-256")
+                .digest(OBJECT_MAPPER.writeValueAsBytes(serialized));
     }
 
     /**

@@ -13,8 +13,17 @@ import java.time.Clock;
  *                                        floor below holds every unauthenticated request open,
  *                                        which without a limiter is a concurrency amplifier
  *                                        rather than a timing defence.
+ * @param metrics                         counter sink for the RFC §19.3 metrics. Defaults to
+ *                                        {@link MetricsRecorder#noop()}, so the counters cost
+ *                                        nothing until something is bound to them.
  * @param stepUpTtlSeconds                lifetime of the token minted for a
  *                                        {@code "step_up": true} completion (RFC §10.3).
+ * @param refreshTtlSeconds               lifetime of a refresh token (RFC §14.1). <b>0 means no
+ *                                        refresh tokens are issued at all</b> and
+ *                                        {@code /auth/refresh} refuses everything — refresh is
+ *                                        opt-in, since it trades a longer-lived credential for
+ *                                        fewer NIP-98 signing prompts and only the deployment
+ *                                        knows whether that is a trade it wants.
  * @param minAuthResponseMillis           floor every auth response is held to, plus
  *                                        {@code responseJitterMillis} of jitter (RFC §15). The
  *                                        generic 401 hides which check failed; latency did not.
@@ -27,6 +36,7 @@ public record NapServerOptions(
         AclResolver aclResolver,
         EventReplayGuard eventReplayGuard,
         RateLimiter rateLimiter,
+        MetricsRecorder metrics,
         Clock clock,
         SecureRandom random,
         int challengeTtlSeconds,
@@ -38,6 +48,7 @@ public record NapServerOptions(
         int lowerBoundGraceSeconds,
         int upperBoundGraceSeconds,
         int stepUpTtlSeconds,
+        int refreshTtlSeconds,
         int maxOutstandingChallengesPerNpub,
         int maxOutstandingChallengesPerIp,
         int maxFailuresPerChallenge,
@@ -73,6 +84,7 @@ public record NapServerOptions(
         private EventReplayGuard eventReplayGuard = EventReplayGuard.inMemory();
         private RateLimiter rateLimiter;
         private boolean rateLimiterSet;
+        private MetricsRecorder metrics = MetricsRecorder.noop();
         private Clock clock = Clock.systemUTC();
         private SecureRandom random = new SecureRandom();
         private int challengeTtlSeconds = DEFAULT_CHALLENGE_TTL_SECONDS;
@@ -84,6 +96,7 @@ public record NapServerOptions(
         private int lowerBoundGraceSeconds = DEFAULT_LOWER_BOUND_GRACE_SECONDS;
         private int upperBoundGraceSeconds = DEFAULT_UPPER_BOUND_GRACE_SECONDS;
         private int stepUpTtlSeconds = DEFAULT_STEP_UP_TTL_SECONDS;
+        private int refreshTtlSeconds;
         private int maxOutstandingChallengesPerNpub = DEFAULT_MAX_OUTSTANDING_PER_NPUB;
         private int maxOutstandingChallengesPerIp = DEFAULT_MAX_OUTSTANDING_PER_IP;
         private int maxFailuresPerChallenge = DEFAULT_MAX_FAILURES_PER_CHALLENGE;
@@ -113,6 +126,12 @@ public record NapServerOptions(
         public Builder lowerBoundGraceSeconds(int grace) { this.lowerBoundGraceSeconds = grace; return this; }
         public Builder upperBoundGraceSeconds(int grace) { this.upperBoundGraceSeconds = grace; return this; }
         public Builder stepUpTtlSeconds(int ttl) { this.stepUpTtlSeconds = ttl; return this; }
+        public Builder refreshTtlSeconds(int ttl) { this.refreshTtlSeconds = ttl; return this; }
+        /** Pass {@code null} for the no-op recorder. */
+        public Builder metrics(MetricsRecorder metrics) {
+            this.metrics = metrics != null ? metrics : MetricsRecorder.noop();
+            return this;
+        }
         public Builder maxOutstandingChallengesPerNpub(int max) { this.maxOutstandingChallengesPerNpub = max; return this; }
         public Builder maxOutstandingChallengesPerIp(int max) { this.maxOutstandingChallengesPerIp = max; return this; }
         public Builder maxFailuresPerChallenge(int max) { this.maxFailuresPerChallenge = max; return this; }
@@ -130,6 +149,14 @@ public record NapServerOptions(
                         "challengeTtlSeconds must be between 1 and " + MAX_CHALLENGE_TTL_SECONDS
                                 + " (RFC §10.1), got " + challengeTtlSeconds);
             }
+            // A refreshTtlSeconds the store cannot honour would mint refresh tokens that every
+            // /auth/refresh then rejects — indistinguishable, from the client, from a session
+            // that keeps silently dying. Fail here instead.
+            if (refreshTtlSeconds > 0 && !sessionStore.supportsRefreshTokens()) {
+                throw new IllegalStateException(
+                        "refreshTtlSeconds requires a SessionStore implementing getByRefreshToken"
+                                + " and rotateRefreshToken");
+            }
             if (!rateLimiterSet) rateLimiter = InMemoryRateLimiter.create();
             // Default policy: when the caller didn't set idle/absolute explicitly, derive
             // from sessionTtlSeconds (pre-006 semantics → fixed TTL, no slide) so
@@ -138,11 +165,12 @@ public record NapServerOptions(
             int absoluteTtl = sessionAbsoluteTtlSeconds != null ? sessionAbsoluteTtlSeconds : sessionTtlSeconds;
             return new NapServerOptions(
                     challengeStore, sessionStore, aclResolver, eventReplayGuard, rateLimiter,
-                    clock, random,
+                    metrics, clock, random,
                     challengeTtlSeconds, sessionTtlSeconds, idleTtl, absoluteTtl,
                     resultCacheTtlSeconds, maxClockSkewSeconds,
                     lowerBoundGraceSeconds, upperBoundGraceSeconds,
-                    stepUpTtlSeconds, maxOutstandingChallengesPerNpub, maxOutstandingChallengesPerIp,
+                    stepUpTtlSeconds, refreshTtlSeconds,
+                    maxOutstandingChallengesPerNpub, maxOutstandingChallengesPerIp,
                     maxFailuresPerChallenge, minAuthResponseMillis, responseJitterMillis
             );
         }

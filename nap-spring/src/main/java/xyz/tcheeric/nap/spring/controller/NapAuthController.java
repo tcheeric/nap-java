@@ -13,6 +13,8 @@ import xyz.tcheeric.nap.core.NapErrorCode;
 import xyz.tcheeric.nap.core.SessionRecord;
 import xyz.tcheeric.nap.core.SessionStore;
 import xyz.tcheeric.nap.server.*;
+import xyz.tcheeric.nap.spring.AudienceResolver;
+import xyz.tcheeric.nap.spring.RawBodyExtractor;
 import xyz.tcheeric.nap.spring.config.NapProperties;
 import xyz.tcheeric.nap.spring.filter.NapServletFilter;
 
@@ -40,13 +42,33 @@ public class NapAuthController {
     private final SessionStore sessionStore;
     private final NapProperties properties;
     private final ObjectMapper objectMapper;
+    private final AudienceResolver audienceResolver;
+    private final RawBodyExtractor rawBodyExtractor;
 
     public NapAuthController(NapServer napServer, SessionStore sessionStore,
                              NapProperties properties, ObjectMapper objectMapper) {
+        this(napServer, sessionStore, properties, objectMapper, null, null);
+    }
+
+    /**
+     * @param audienceResolver {@code null} for the default, {@code externalBaseUrl} +
+     *                         {@code /api/v1/auth/complete} (RFC §20.2).
+     * @param rawBodyExtractor {@code null} for the default, the bytes {@link NapServletFilter}
+     *                         captured.
+     */
+    public NapAuthController(NapServer napServer, SessionStore sessionStore,
+                             NapProperties properties, ObjectMapper objectMapper,
+                             AudienceResolver audienceResolver, RawBodyExtractor rawBodyExtractor) {
         this.napServer = napServer;
         this.sessionStore = sessionStore;
         this.properties = properties;
         this.objectMapper = objectMapper;
+        this.audienceResolver = audienceResolver != null
+                ? audienceResolver
+                : request -> properties.externalBaseUrl() + "/api/v1/auth/complete";
+        this.rawBodyExtractor = rawBodyExtractor != null
+                ? rawBodyExtractor
+                : request -> (byte[]) request.getAttribute(NapServletFilter.RAW_BODY_ATTRIBUTE);
     }
 
     @PostMapping("/init")
@@ -59,7 +81,7 @@ public class NapAuthController {
                     .body(Map.of("status", "error", "message", "npub or pubkey is required"));
         }
 
-        String authUrl = properties.externalBaseUrl() + "/api/v1/auth/complete";
+        String authUrl = audienceResolver.resolve(request);
 
         IssueChallengeResult result = napServer.issueChallenge(new IssueChallengeInput(
                 npub != null ? npub : pubkey, authUrl, "POST", request.getRemoteAddr()));
@@ -87,13 +109,13 @@ public class NapAuthController {
     @PostMapping("/complete")
     public ResponseEntity<?> complete(HttpServletRequest request, HttpServletResponse response) {
 
-        byte[] rawBody = (byte[]) request.getAttribute(NapServletFilter.RAW_BODY_ATTRIBUTE);
+        byte[] rawBody = rawBodyExtractor.extract(request);
         if (rawBody == null) {
             return ResponseEntity.badRequest()
                     .body(Map.of("status", "error", "message", "Request body not captured"));
         }
 
-        String authUrl = properties.externalBaseUrl() + "/api/v1/auth/complete";
+        String authUrl = audienceResolver.resolve(request);
         String authorization = resolveAuthorization(request, rawBody);
 
         VerifyCompletionOutcome outcome = napServer.verifyCompletion(new VerifyCompletionInput(
@@ -118,6 +140,58 @@ public class NapAuthController {
                     ResponseEntity.badRequest()
                             .body(Map.of("status", "error", "message", "bad request"));
         };
+    }
+
+    /**
+     * {@code POST /api/v1/auth/refresh} — exchanges a rotating refresh token for a new access
+     * token (RFC §14.1). The token is presented as {@code Authorization: Bearer <token>}, not
+     * in the body: it is a credential, and a body would be logged by anything that logs
+     * request payloads.
+     *
+     * <p>Registered unconditionally. With {@code nap.refresh-ttl-seconds} unset the server
+     * answers every call exactly as it answers an unknown token — whether a deployment offers
+     * refresh is not something an anonymous caller needs confirmed.
+     */
+    @PostMapping("/refresh")
+    public ResponseEntity<?> refresh(HttpServletRequest request, HttpServletResponse response) {
+        RefreshSessionOutcome outcome = napServer.refreshSession(new RefreshSessionInput(
+                bearerToken(request), request.getRemoteAddr()));
+
+        return switch (outcome) {
+            case RefreshSessionOutcome.Success s -> {
+                // The session id is unchanged by a rotation, but re-setting the cookie renews
+                // its Max-Age — otherwise a session that keeps refreshing still loses its
+                // cookie at the original absolute cap.
+                setCookie(response, s.session().sessionId());
+                yield ResponseEntity.ok(napServer.toPublicAuthSuccess(s.session()));
+            }
+            case RefreshSessionOutcome.Failure f when f.code() == NapErrorCode.NAP_REFRESH_RATE_LIMITED ->
+                    rateLimited(f.retryAfterSeconds());
+            case RefreshSessionOutcome.Failure f -> {
+                log.warn("nap_refresh_failed code={}", f.code());
+                // Deliberately does *not* clear the cookie. This endpoint needs no cookie and no
+                // Authorization header to reach this branch, so clearing here would let any
+                // cross-site POST to /auth/refresh log out every visitor holding a live session
+                // — and even same-origin it would end a session whose access token was fine
+                // just because the client presented a stale refresh token. Only /auth/logout
+                // and an explicitly ended session clear it.
+                //
+                // The same uniform 401 as a failed completion, for the same reason: which
+                // check failed is the attacker's question, not the client's.
+                yield ResponseEntity.status(HttpStatus.UNAUTHORIZED)
+                        .body(napServer.toPublicAuthFailure().body());
+            }
+        };
+    }
+
+    /** {@code Authorization: Bearer <token>}, or {@code null}. */
+    private static String bearerToken(HttpServletRequest request) {
+        String header = request.getHeader("Authorization");
+        if (header == null || !header.regionMatches(true, 0, "Bearer ", 0, 7)) {
+            return null;
+        }
+        String token = header.substring(7).trim();
+        return token.isEmpty() ? null : token;
     }
 
     private static ResponseEntity<?> rateLimited(Integer retryAfterSeconds) {

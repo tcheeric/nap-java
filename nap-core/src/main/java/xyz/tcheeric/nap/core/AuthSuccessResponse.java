@@ -26,8 +26,17 @@ public record AuthSuccessResponse(
         List<String> roles,
         List<String> permissions,
         String stepUpToken,
-        Long stepUpExpiresAt
+        Long stepUpExpiresAt,
+        String refreshToken,
+        Long refreshExpiresAt
 ) {
+
+    public AuthSuccessResponse(String status, String accessToken, String tokenType, long expiresAt,
+                               long absoluteExpiryAt, Principal principal, List<String> roles,
+                               List<String> permissions, String stepUpToken, Long stepUpExpiresAt) {
+        this(status, accessToken, tokenType, expiresAt, absoluteExpiryAt, principal, roles,
+                permissions, stepUpToken, stepUpExpiresAt, null, null);
+    }
 
     public AuthSuccessResponse(String status, String accessToken, String tokenType, long expiresAt,
                                long absoluteExpiryAt, Principal principal, List<String> roles,

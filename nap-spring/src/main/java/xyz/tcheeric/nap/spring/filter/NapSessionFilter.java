@@ -106,22 +106,7 @@ public class NapSessionFilter extends OncePerRequestFilter {
             return;
         }
 
-        SessionRecord effectiveRecord = new SessionRecord(
-                record.sessionId(),
-                record.challengeId(),
-                record.accessToken(),
-                record.principalNpub(),
-                record.principalPubkey(),
-                aclDecision.roles(),
-                aclDecision.permissions(),
-                record.issuedAt(),
-                record.lastActivityAt(),
-                record.expiresAt(),
-                record.absoluteExpiryAt(),
-                record.revokedAt(),
-                record.stepUpToken(),
-                record.stepUpExpiresAt()
-        );
+        SessionRecord effectiveRecord = record.withAcl(aclDecision.roles(), aclDecision.permissions());
 
         SecurityContextHolder.getContext().setAuthentication(new NapAuthenticationToken(effectiveRecord));
         try {

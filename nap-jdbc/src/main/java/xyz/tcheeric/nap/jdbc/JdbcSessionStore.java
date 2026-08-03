@@ -5,6 +5,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import xyz.tcheeric.nap.core.RotateRefreshTokenParams;
 import xyz.tcheeric.nap.core.SessionRecord;
 import xyz.tcheeric.nap.core.SessionStore;
 
@@ -19,16 +20,17 @@ import java.util.Optional;
 /**
  * PostgreSQL-backed SessionStore using plain JDBC.
  *
- * <p>Spec 006 adds two columns to {@code nap_sessions}:
- * <pre>
- *   ALTER TABLE nap_sessions ADD COLUMN last_activity_at    BIGINT NOT NULL DEFAULT 0;
- *   ALTER TABLE nap_sessions ADD COLUMN absolute_expiry_at  BIGINT NOT NULL DEFAULT 0;
- *   UPDATE nap_sessions SET last_activity_at = issued_at,
- *                           absolute_expiry_at = expires_at
- *     WHERE last_activity_at = 0 OR absolute_expiry_at = 0;
- * </pre>
- * Consumers own their schema — apply this migration before deploying a NAP
- * server that reads/writes these columns.
+ * <p>The schema this class expects is {@code V1__create_nap_tables.sql} through
+ * {@code V3__sliding_window_and_refresh_tokens.sql} in {@code db/migration}. V3 carries the
+ * spec 006 sliding-window columns ({@code last_activity_at}, {@code absolute_expiry_at}) and
+ * the RFC §14.1 refresh columns ({@code refresh_token}, {@code refresh_expires_at},
+ * {@code previous_refresh_token}); before it existed, both sets lived only in this comment,
+ * and a database built from V1 and V2 alone could neither accept an insert from this store
+ * nor be mapped by it.
+ *
+ * <p>Consumers own their schema. Apply every migration through V3 before deploying — the
+ * refresh columns are needed even when {@code refreshTtlSeconds} is unset, because the
+ * INSERT always lists them.
  */
 public final class JdbcSessionStore implements SessionStore {
 
@@ -47,8 +49,9 @@ public final class JdbcSessionStore implements SessionStore {
         String sql = """
                 INSERT INTO nap_sessions (session_id, challenge_id, access_token, principal_npub,
                     principal_pubkey, roles, permissions, issued_at, last_activity_at,
-                    expires_at, absolute_expiry_at, step_up_token, step_up_expires_at)
-                VALUES (?, ?, ?, ?, ?, ?::jsonb, ?::jsonb, ?, ?, ?, ?, ?, ?)
+                    expires_at, absolute_expiry_at, step_up_token, step_up_expires_at,
+                    refresh_token, refresh_expires_at)
+                VALUES (?, ?, ?, ?, ?, ?::jsonb, ?::jsonb, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (challenge_id) DO NOTHING
                 """;
         try (Connection conn = dataSource.getConnection();
@@ -65,11 +68,9 @@ public final class JdbcSessionStore implements SessionStore {
             ps.setLong(10, record.expiresAt());
             ps.setLong(11, record.absoluteExpiryAt());
             ps.setString(12, record.stepUpToken());
-            if (record.stepUpExpiresAt() == null) {
-                ps.setNull(13, java.sql.Types.BIGINT);
-            } else {
-                ps.setLong(13, record.stepUpExpiresAt());
-            }
+            setNullableLong(ps, 13, record.stepUpExpiresAt());
+            ps.setString(14, record.refreshToken());
+            setNullableLong(ps, 15, record.refreshExpiresAt());
             int rows = ps.executeUpdate();
             if (rows == 0) {
                 // Already exists — return existing
@@ -143,6 +144,77 @@ public final class JdbcSessionStore implements SessionStore {
         }
     }
 
+    /**
+     * Deliberately no {@code revoked_at IS NULL} filter and deliberately matching the
+     * previous token too: a replay on a retired token is the signal rotation exists to
+     * surface, and filtering it out would make a theft look like a typo.
+     */
+    @Override
+    public Optional<SessionRecord> getByRefreshToken(String refreshToken) {
+        String sql = "SELECT * FROM nap_sessions WHERE refresh_token = ? OR previous_refresh_token = ?";
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, refreshToken);
+            ps.setString(2, refreshToken);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? Optional.of(mapRow(rs)) : Optional.empty();
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException("Failed to find session by refresh token", e);
+        }
+    }
+
+    @Override
+    public Optional<SessionRecord> rotateRefreshToken(String sessionId, RotateRefreshTokenParams params) {
+        // `refresh_token = ?` in the WHERE clause is the compare-and-swap: two concurrent
+        // refreshes off one credential race here, and exactly one updates a row.
+        String sql = """
+                UPDATE nap_sessions
+                   SET access_token           = ?,
+                       expires_at             = ?,
+                       last_activity_at       = ?,
+                       roles                  = ?::jsonb,
+                       permissions            = ?::jsonb,
+                       previous_refresh_token = refresh_token,
+                       refresh_token          = ?,
+                       refresh_expires_at     = ?
+                 WHERE session_id = ?
+                   AND refresh_token = ?
+                   AND revoked_at IS NULL
+                """;
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, params.accessToken());
+            ps.setLong(2, params.expiresAt());
+            ps.setLong(3, params.now());
+            ps.setString(4, toJson(params.roles()));
+            ps.setString(5, toJson(params.permissions()));
+            ps.setString(6, params.refreshToken());
+            ps.setLong(7, params.refreshExpiresAt());
+            ps.setString(8, sessionId);
+            ps.setString(9, params.expectedRefreshToken());
+            if (ps.executeUpdate() == 0) {
+                return Optional.empty();
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException("Failed to rotate refresh token", e);
+        }
+        return getBySessionId(sessionId);
+    }
+
+    @Override
+    public boolean supportsRefreshTokens() {
+        return true;
+    }
+
+    private static void setNullableLong(PreparedStatement ps, int index, Long value) throws SQLException {
+        if (value == null) {
+            ps.setNull(index, java.sql.Types.BIGINT);
+        } else {
+            ps.setLong(index, value);
+        }
+    }
+
     private Optional<SessionRecord> findByChallengeId(String challengeId) {
         return findBy("challenge_id", challengeId);
     }
@@ -185,7 +257,10 @@ public final class JdbcSessionStore implements SessionStore {
                 absoluteExpiryAt,
                 rs.getObject("revoked_at") != null ? rs.getLong("revoked_at") : null,
                 rs.getString("step_up_token"),
-                rs.getObject("step_up_expires_at") != null ? rs.getLong("step_up_expires_at") : null
+                rs.getObject("step_up_expires_at") != null ? rs.getLong("step_up_expires_at") : null,
+                rs.getString("refresh_token"),
+                rs.getObject("refresh_expires_at") != null ? rs.getLong("refresh_expires_at") : null,
+                rs.getString("previous_refresh_token")
         );
     }
 

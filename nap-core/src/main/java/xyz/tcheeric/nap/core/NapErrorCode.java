@@ -29,7 +29,21 @@ public enum NapErrorCode {
     /** The challenge burned through its failure budget (RFC §13.4) — a retry cannot help. */
     NAP_COMPLETE_FAILED_TERMINAL(false),
     NAP_COMPLETE_RATE_LIMITED(true),
-    NAP_COMPLETE_INTERNAL(true);
+    NAP_COMPLETE_INTERNAL(true),
+
+    /**
+     * RFC §14.1. Not retryable, every one of them: the presented credential is gone and
+     * only a fresh NIP-98 login replaces it. {@code NAP_REFRESH_REUSED} in particular means
+     * the whole session was just revoked — a retired token came back, so two parties held
+     * the lineage and the server cannot tell which was the thief.
+     */
+    NAP_REFRESH_UNKNOWN_TOKEN(false),
+    NAP_REFRESH_REUSED(false),
+    NAP_REFRESH_EXPIRED(false),
+    NAP_REFRESH_REVOKED(false),
+    NAP_REFRESH_ACL_DENIED(false),
+    NAP_REFRESH_RATE_LIMITED(true),
+    NAP_REFRESH_INTERNAL(true);
 
     private final boolean retryable;
 

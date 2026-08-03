@@ -35,7 +35,17 @@ final class DefaultNapServer implements NapServer {
         long startedAtNanos = System.nanoTime();
         IssueChallengeResult result = null;
         try {
+            // Counted before anything can reject the request: a total that only sees
+            // well-formed calls cannot be the denominator for the failure rate.
+            count(NapCounter.AUTH_INIT_TOTAL);
             result = issueChallengeUnpadded(input);
+            // Only the failure side. Issuing a challenge is not an authentication, and counting
+            // it in auth_success_total would make that counter "inits + completions" here and
+            // "completions" in the TypeScript implementation — the same §19.3 name measuring
+            // two different things.
+            if (result instanceof IssueChallengeResult.Failure f) {
+                countOutcome(f.code());
+            }
             return result;
         } finally {
             if (!isRateLimited(result, NapErrorCode.NAP_INIT_RATE_LIMITED)) {
@@ -104,7 +114,14 @@ final class DefaultNapServer implements NapServer {
         long startedAtNanos = System.nanoTime();
         VerifyCompletionOutcome outcome = null;
         try {
+            count(NapCounter.AUTH_COMPLETE_TOTAL);
             outcome = verifyCompletionUnpadded(input);
+            // A malformed request never reached a decision, so it is counted in the total and
+            // nowhere else — folding it into the failure counter would make a broken client
+            // read as an authentication problem.
+            if (!(outcome instanceof VerifyCompletionOutcome.MalformedRequest)) {
+                countOutcome(outcome instanceof VerifyCompletionOutcome.Failure f ? f.code() : null);
+            }
             return outcome;
         } finally {
             if (!isRateLimited(outcome, NapErrorCode.NAP_COMPLETE_RATE_LIMITED)) {
@@ -227,6 +244,11 @@ final class DefaultNapServer implements NapServer {
         // user never asked for.
         String stepUpToken = body.stepUp() ? base64Url(randomBytes(32)) : null;
         Long stepUpExpiresAt = body.stepUp() ? now + options.stepUpTtlSeconds() : null;
+        // Refresh is opt-in: no TTL configured means no refresh credential is minted at all,
+        // and /auth/refresh has nothing to accept.
+        int refreshTtl = options.refreshTtlSeconds();
+        String refreshToken = refreshTtl > 0 ? base64Url(randomBytes(32)) : null;
+        Long refreshExpiresAt = refreshTtl > 0 ? now + refreshTtl : null;
         SessionRecord session = options.sessionStore().createForChallenge(new SessionRecord(
                 base64Url(randomBytes(24)),
                 challenge.challengeId(),
@@ -234,7 +256,8 @@ final class DefaultNapServer implements NapServer {
                 challenge.npub(), challenge.pubkey(),
                 aclDecision.roles(), aclDecision.permissions(),
                 now, now, idleExpiresAt, absoluteExpiryAt,
-                null, stepUpToken, stepUpExpiresAt
+                null, stepUpToken, stepUpExpiresAt,
+                refreshToken, refreshExpiresAt, null
         ));
 
         RedeemResult redeemResult = options.challengeStore().redeem(challenge.challengeId(), new RedeemParams(
@@ -243,6 +266,7 @@ final class DefaultNapServer implements NapServer {
         ));
 
         if (redeemResult == RedeemResult.REDEEMED) {
+            count(NapCounter.CHALLENGE_REDEEMED_TOTAL);
             return VerifyCompletionOutcome.success(session);
         }
 
@@ -262,6 +286,9 @@ final class DefaultNapServer implements NapServer {
                 && (redeemedChallenge.resultCacheUntil() == null || redeemedChallenge.resultCacheUntil() >= now)) {
             var existingSession = options.sessionStore().getBySessionId(redeemedChallenge.redeemedSessionId());
             if (existingSession.isPresent()) {
+                // Not a second redemption: RFC §13.3 makes the cached answer the correct one,
+                // so a climbing retry rate is a client bug worth seeing apart from a login rate.
+                count(NapCounter.CHALLENGE_RETRY_HIT_TOTAL);
                 return VerifyCompletionOutcome.success(existingSession.get());
             }
             return VerifyCompletionOutcome.failure(NapErrorCode.NAP_COMPLETE_INTERNAL);
@@ -271,14 +298,177 @@ final class DefaultNapServer implements NapServer {
     }
 
     @Override
+    public RefreshSessionOutcome refreshSession(RefreshSessionInput input) {
+        long startedAtNanos = System.nanoTime();
+        RefreshSessionOutcome outcome = null;
+        try {
+            outcome = refreshSessionUnpadded(input);
+            countOutcome(outcome instanceof RefreshSessionOutcome.Failure f ? f.code() : null);
+            return outcome;
+        } finally {
+            if (!(outcome instanceof RefreshSessionOutcome.Failure f
+                    && f.code() == NapErrorCode.NAP_REFRESH_RATE_LIMITED)) {
+                padAuthResponse(startedAtNanos);
+            }
+        }
+    }
+
+    private RefreshSessionOutcome refreshSessionUnpadded(RefreshSessionInput input) {
+        SessionStore store = options.sessionStore();
+
+        // Answered exactly like an unknown token. Whether a deployment offers refresh at all is
+        // not something an anonymous caller needs confirmed, and the options builder already
+        // refuses the misconfiguration that would make this the interesting branch.
+        if (options.refreshTtlSeconds() <= 0 || !store.supportsRefreshTokens()) {
+            return RefreshSessionOutcome.failure(NapErrorCode.NAP_REFRESH_UNKNOWN_TOKEN);
+        }
+
+        RateLimitDecision rateLimit = checkRateLimit(RateLimitKey.refresh(input.clientIp()));
+        if (!rateLimit.allowed()) {
+            log.warn("nap_refresh_rate_limited");
+            return RefreshSessionOutcome.rateLimited(
+                    NapErrorCode.NAP_REFRESH_RATE_LIMITED, rateLimit.retryAfterSeconds());
+        }
+
+        String presented = input.refreshToken();
+        if (presented == null || presented.isBlank()) {
+            return RefreshSessionOutcome.failure(NapErrorCode.NAP_REFRESH_UNKNOWN_TOKEN);
+        }
+
+        SessionRecord session = store.getByRefreshToken(presented).orElse(null);
+        if (session == null) {
+            return RefreshSessionOutcome.failure(NapErrorCode.NAP_REFRESH_UNKNOWN_TOKEN);
+        }
+
+        long now = options.clock().instant().getEpochSecond();
+
+        // Checked before expiry and revocation: a replay is worth acting on whatever else is
+        // wrong with the session, and reporting it as merely expired would hide the only
+        // signal that a token leaked.
+        if (constantTimeEquals(session.previousRefreshToken(), presented)) {
+            store.revokeBySessionId(session.sessionId(), now);
+            log.warn("nap_refresh_reused session_id={} pubkey={}",
+                    session.sessionId(), session.principalPubkey());
+            return RefreshSessionOutcome.failure(NapErrorCode.NAP_REFRESH_REUSED);
+        }
+
+        // A store that answered with a session holding neither the presented token nor its
+        // predecessor has a broken index; treat it as no match rather than rotate a session
+        // the caller has not proved anything about.
+        if (!constantTimeEquals(session.refreshToken(), presented)) {
+            return RefreshSessionOutcome.failure(NapErrorCode.NAP_REFRESH_UNKNOWN_TOKEN);
+        }
+
+        if (session.revokedAt() != null) {
+            return RefreshSessionOutcome.failure(NapErrorCode.NAP_REFRESH_REVOKED);
+        }
+
+        if (session.refreshExpiresAt() == null || session.refreshExpiresAt() < now) {
+            return RefreshSessionOutcome.failure(NapErrorCode.NAP_REFRESH_EXPIRED);
+        }
+
+        // The absolute cap ends the session, not just its current access token. Without this the
+        // clamp below would hand back an expires_at already in the past — a 200 carrying a dead
+        // token — and since every rotation re-arms refresh_expires_at, the family would outlive
+        // the cap indefinitely.
+        if (session.absoluteExpiryAt() <= now) {
+            return RefreshSessionOutcome.failure(NapErrorCode.NAP_REFRESH_EXPIRED);
+        }
+
+        AclDecision aclDecision =
+                options.aclResolver().resolve(session.principalNpub(), session.principalPubkey());
+        if (!aclDecision.allowed()) {
+            // Same rule as a guarded request: only a denial the resolver is certain about ends
+            // every session. A resolver that could not *read* the ACL denies this refresh and
+            // nothing more — the access token still expires on its own schedule, so nothing is
+            // granted by waiting.
+            if (aclDecision.revokeSessions()) {
+                store.revokeByPrincipal(session.principalPubkey(), now);
+            }
+            log.warn("nap_refresh_acl_denied session_id={} reason={}",
+                    session.sessionId(), aclDecision.reason());
+            return RefreshSessionOutcome.failure(NapErrorCode.NAP_REFRESH_ACL_DENIED);
+        }
+
+        // The sliding cap still applies: a refresh advances the idle window but cannot push a
+        // session past the absolute expiry it was created with.
+        long expiresAt = Math.min(now + options.sessionIdleTtlSeconds(), session.absoluteExpiryAt());
+
+        SessionRecord rotated = store.rotateRefreshToken(session.sessionId(), new RotateRefreshTokenParams(
+                presented,
+                base64Url(randomBytes(32)),
+                base64Url(randomBytes(32)),
+                now,
+                expiresAt,
+                now + options.refreshTtlSeconds(),
+                aclDecision.roles(),
+                aclDecision.permissions()
+        )).orElse(null);
+
+        if (rotated == null) {
+            log.warn("nap_refresh_rotate_failed session_id={}", session.sessionId());
+            return RefreshSessionOutcome.failure(NapErrorCode.NAP_REFRESH_INTERNAL);
+        }
+
+        return RefreshSessionOutcome.success(rotated);
+    }
+
+    @Override
     public AuthSuccessResponse toPublicAuthSuccess(SessionRecord session) {
         return new AuthSuccessResponse(
                 "ok",
                 session.accessToken(), "Bearer", session.expiresAt(), session.absoluteExpiryAt(),
                 new AuthSuccessResponse.Principal(session.principalNpub(), session.principalPubkey()),
                 session.roles(), session.permissions(),
-                session.stepUpToken(), session.stepUpExpiresAt()
+                session.stepUpToken(), session.stepUpExpiresAt(),
+                session.refreshToken(), session.refreshExpiresAt()
         );
+    }
+
+    /** Null-tolerant and length-independent only past the null check — both sides are tokens. */
+    private static boolean constantTimeEquals(String a, String b) {
+        if (a == null || b == null) {
+            return false;
+        }
+        return java.security.MessageDigest.isEqual(
+                a.getBytes(StandardCharsets.UTF_8), b.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private void count(NapCounter counter) {
+        try {
+            options.metrics().increment(counter);
+        } catch (RuntimeException e) {
+            // A metrics backend being down is not a reason to stop authenticating.
+            log.debug("metrics increment failed: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * The three outcome counters follow the outcome alone; the code-specific ones name a
+     * particular failure. {@code NAP_COMPLETE_MISSING_PAYLOAD} is deliberately not counted as a
+     * payload mismatch: nothing was compared, so calling it a mismatch would blur a client that
+     * omits the tag with one whose body was rewritten in transit — the very thing the counter
+     * is watched for.
+     */
+    private void countOutcome(NapErrorCode code) {
+        if (code == null) {
+            count(NapCounter.AUTH_SUCCESS_TOTAL);
+            return;
+        }
+
+        count(code == NapErrorCode.NAP_INIT_RATE_LIMITED
+                || code == NapErrorCode.NAP_COMPLETE_RATE_LIMITED
+                || code == NapErrorCode.NAP_REFRESH_RATE_LIMITED
+                ? NapCounter.AUTH_RATE_LIMITED_TOTAL
+                : NapCounter.AUTH_FAILURE_TOTAL);
+
+        switch (code) {
+            case NAP_COMPLETE_EXPIRED_CHALLENGE -> count(NapCounter.CHALLENGE_EXPIRED_TOTAL);
+            // The NIP-98 `u` tag *is* the audience.
+            case NAP_COMPLETE_URL_MISMATCH -> count(NapCounter.AUDIENCE_MISMATCH_TOTAL);
+            case NAP_COMPLETE_PAYLOAD_MISMATCH -> count(NapCounter.PAYLOAD_MISMATCH_TOTAL);
+            default -> { }
+        }
     }
 
     @Override
@@ -432,6 +622,7 @@ final class DefaultNapServer implements NapServer {
                 && (challenge.resultCacheUntil() == null || challenge.resultCacheUntil() >= now)) {
             var existingSession = options.sessionStore().getBySessionId(challenge.redeemedSessionId());
             if (existingSession.isPresent()) {
+                count(NapCounter.CHALLENGE_RETRY_HIT_TOTAL);
                 return VerifyCompletionOutcome.success(existingSession.get());
             }
             return VerifyCompletionOutcome.failure(NapErrorCode.NAP_COMPLETE_INTERNAL);
