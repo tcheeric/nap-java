@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Removed
+
+- **`NapServletFilter(String)` and `NapServletFilter()`**, the two constructors that
+  defaulted `maxBodyBytes` to 1024. The auto-configuration deliberately does not register
+  the filter — the application does — so `nap.max-body-bytes` is only honoured if the
+  registration passes it. Either defaulting constructor took it silently: a deployment
+  that tightened the cap ran on 1024 anyway, and one that raised it 413'd bodies it had
+  configured itself to accept, neither with a word in the log. Only
+  `NapServletFilter(String, int)` remains, so leaving the cap out is now a compile error.
+  Existing registrations change to
+  `new NapServletFilter("/auth/complete", properties.maxBodyBytes())`.
+  `NapSessionFilter` already took all five of its settings this way.
+
+### Changed
+
+- `NapProperties` falls back to `NapServletFilter.DEFAULT_MAX_BODY_BYTES` when
+  `nap.max-body-bytes` is unset, rather than repeating the literal. Same value, one source.
+
 ## [0.4.1] - 2026-08-04
 
 ### Fixed

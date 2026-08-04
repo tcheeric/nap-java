@@ -17,6 +17,24 @@ import java.io.InputStreamReader;
  *
  * <p>Only activates on the auth complete path to avoid memory pressure from body buffering
  * on high-throughput endpoints.
+ *
+ * <p>The auto-configuration deliberately does not register this filter, so the application does,
+ * and the cap has to be passed at that site:
+ *
+ * <pre>{@code
+ * @Bean
+ * FilterRegistrationBean<NapServletFilter> napServletFilter(NapProperties properties) {
+ *     var registration = new FilterRegistrationBean<>(
+ *             new NapServletFilter("/auth/complete", properties.maxBodyBytes()));
+ *     registration.setOrder(Ordered.HIGHEST_PRECEDENCE);
+ *     return registration;
+ * }
+ * }</pre>
+ *
+ * <p>There is deliberately no constructor that defaults the cap. One used to exist, and a
+ * registration that took it silently ignored {@code nap.max-body-bytes} — a deployment that
+ * tightened the cap ran on 1024 anyway, and one that raised it 413'd bodies it had configured
+ * itself to accept, both without a word. The compiler is the check now.
  */
 public class NapServletFilter extends OncePerRequestFilter {
 
@@ -25,6 +43,9 @@ public class NapServletFilter extends OncePerRequestFilter {
     /**
      * A valid {@code /auth/complete} body is ~40 bytes. The cap (RFC §17.4) bounds what an
      * anonymous caller can make the server buffer and hash per request.
+     *
+     * <p>This is what {@code nap.max-body-bytes} falls back to when unset, not a default this
+     * filter applies on its own — see {@link xyz.tcheeric.nap.spring.config.NapProperties}.
      */
     public static final int DEFAULT_MAX_BODY_BYTES = 1024;
 
@@ -34,14 +55,6 @@ public class NapServletFilter extends OncePerRequestFilter {
     public NapServletFilter(String completePath, int maxBodyBytes) {
         this.completePath = completePath;
         this.maxBodyBytes = maxBodyBytes;
-    }
-
-    public NapServletFilter(String completePath) {
-        this(completePath, DEFAULT_MAX_BODY_BYTES);
-    }
-
-    public NapServletFilter() {
-        this("/auth/complete");
     }
 
     @Override
