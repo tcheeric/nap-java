@@ -69,7 +69,15 @@ new NapSessionFilter(sessionStore, aclResolver, properties.cookie().name(),
                      Duration.ofSeconds(properties.aclRefreshIntervalSeconds()));
 ```
 
-Guard endpoints with `@RequiresPermission` (preferred), `@RequiresRole`, or `@RequiresStepUp`.
+Guard endpoints with `@RequiresPermission` (preferred), `@RequiresRole`, `@RequiresStepUp`, or
+`@RequiresSession` when the endpoint is for signed-in users generally and no permission
+distinguishes them.
+
+**A handler that declares none of these is not guarded.** `NapSessionFilter` populates the
+`SecurityContext` on `nap.protected-path-prefixes` but lets unauthenticated requests through, and
+the interceptor only rejects handlers that declare a requirement — so a protected prefix means
+"authenticate here if you can", not "login required". `@RequiresSession` is how a handler says
+the latter.
 
 ## Persistence
 

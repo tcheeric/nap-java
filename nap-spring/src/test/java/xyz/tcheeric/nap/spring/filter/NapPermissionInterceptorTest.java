@@ -13,6 +13,7 @@ import xyz.tcheeric.nap.server.acl.PermissionDefinition;
 import xyz.tcheeric.nap.server.acl.PermissionRegistry;
 import xyz.tcheeric.nap.spring.annotation.RequiresPermission;
 import xyz.tcheeric.nap.spring.annotation.RequiresRole;
+import xyz.tcheeric.nap.spring.annotation.RequiresSession;
 import xyz.tcheeric.nap.spring.annotation.RequiresStepUp;
 
 import java.time.Instant;
@@ -139,6 +140,66 @@ class NapPermissionInterceptorTest {
 
         assertThat(allowed).isFalse();
         assertThat(response.getStatus()).isEqualTo(HttpServletResponse.SC_FORBIDDEN);
+    }
+
+    // --- session-only guard ---
+
+    @Test
+    void preHandle_allowsSessionGuardForAnyAuthenticatedPrincipal() throws Exception {
+        // No roles, no authorities — the point of the guard is that neither matters.
+        SecurityContextHolder.getContext().setAuthentication(
+                new TestingAuthenticationToken("anyone", null, java.util.List.of())
+        );
+        HandlerMethod handlerMethod = new HandlerMethod(new TestController(),
+                TestController.class.getDeclaredMethod("sessionEndpoint"));
+        var request = new org.springframework.mock.web.MockHttpServletRequest("GET", "/me");
+        var response = new org.springframework.mock.web.MockHttpServletResponse();
+
+        boolean allowed = interceptor.preHandle(request, response, handlerMethod);
+
+        assertThat(allowed).isTrue();
+        assertThat(response.getStatus()).isEqualTo(HttpServletResponse.SC_OK);
+    }
+
+    @Test
+    void preHandle_returnsUnauthorizedForSessionGuardWithoutAuthentication() throws Exception {
+        HandlerMethod handlerMethod = new HandlerMethod(new TestController(),
+                TestController.class.getDeclaredMethod("sessionEndpoint"));
+        var request = new org.springframework.mock.web.MockHttpServletRequest("GET", "/me");
+        var response = new org.springframework.mock.web.MockHttpServletResponse();
+
+        boolean allowed = interceptor.preHandle(request, response, handlerMethod);
+
+        assertThat(allowed).isFalse();
+        assertThat(response.getStatus()).isEqualTo(HttpServletResponse.SC_UNAUTHORIZED);
+    }
+
+    @Test
+    void preHandle_bindsAClassLevelSessionDeclaration() throws Exception {
+        HandlerMethod handlerMethod = new HandlerMethod(new SessionController(),
+                SessionController.class.getDeclaredMethod("inheritsSessionFromTheClass"));
+        var request = new org.springframework.mock.web.MockHttpServletRequest("GET", "/me");
+        var response = new org.springframework.mock.web.MockHttpServletResponse();
+
+        boolean allowed = interceptor.preHandle(request, response, handlerMethod);
+
+        assertThat(allowed).isFalse();
+        assertThat(response.getStatus()).isEqualTo(HttpServletResponse.SC_UNAUTHORIZED);
+    }
+
+    @Test
+    void preHandle_stillAllowsAnUnannotatedHandlerThrough() throws Exception {
+        // Documents why @RequiresSession has to exist: the interceptor gates what a handler
+        // declares, and NapSessionFilter authenticates on protected prefixes without enforcing,
+        // so a handler declaring nothing is reachable unauthenticated.
+        HandlerMethod handlerMethod = new HandlerMethod(new TestController(),
+                TestController.class.getDeclaredMethod("unguardedEndpoint"));
+        var request = new org.springframework.mock.web.MockHttpServletRequest("GET", "/public");
+        var response = new org.springframework.mock.web.MockHttpServletResponse();
+
+        boolean allowed = interceptor.preHandle(request, response, handlerMethod);
+
+        assertThat(allowed).isTrue();
     }
 
     // --- step-up (RFC §10.3) ---
@@ -303,6 +364,21 @@ class NapPermissionInterceptorTest {
         @RequiresPermission("admin")
         @RequiresRole("merchant")
         public void bothEndpoint() {
+        }
+
+        @RequiresSession
+        public void sessionEndpoint() {
+        }
+
+        /** Declares nothing — reachable without authentication, which is why the annotation exists. */
+        public void unguardedEndpoint() {
+        }
+    }
+
+    @RequiresSession
+    private static class SessionController {
+
+        public void inheritsSessionFromTheClass() {
         }
     }
 }

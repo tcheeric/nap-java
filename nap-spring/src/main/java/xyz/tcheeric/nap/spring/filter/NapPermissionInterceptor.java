@@ -10,6 +10,7 @@ import xyz.tcheeric.nap.core.SessionRecord;
 import xyz.tcheeric.nap.server.acl.PermissionRegistry;
 import xyz.tcheeric.nap.spring.annotation.RequiresPermission;
 import xyz.tcheeric.nap.spring.annotation.RequiresRole;
+import xyz.tcheeric.nap.spring.annotation.RequiresSession;
 import xyz.tcheeric.nap.spring.annotation.RequiresStepUp;
 
 import java.nio.charset.StandardCharsets;
@@ -51,7 +52,9 @@ public class NapPermissionInterceptor implements HandlerInterceptor {
         RequiresPermission permissionAnnotation = findAnnotation(handlerMethod);
         RequiresRole roleAnnotation = findRoleAnnotation(handlerMethod);
         RequiresStepUp stepUpAnnotation = findStepUpAnnotation(handlerMethod);
-        if (permissionAnnotation == null && roleAnnotation == null && stepUpAnnotation == null) {
+        RequiresSession sessionAnnotation = findSessionAnnotation(handlerMethod);
+        if (permissionAnnotation == null && roleAnnotation == null && stepUpAnnotation == null
+                && sessionAnnotation == null) {
             return true;
         }
 
@@ -142,6 +145,20 @@ public class NapPermissionInterceptor implements HandlerInterceptor {
         }
         return AnnotatedElementUtils.findMergedAnnotation(
                 handlerMethod.getBeanType(), RequiresRole.class);
+    }
+
+    /**
+     * Carries no check of its own beyond the authentication gate above — declaring it is the
+     * whole point, since a handler declaring nothing is never gated at all.
+     */
+    private RequiresSession findSessionAnnotation(HandlerMethod handlerMethod) {
+        RequiresSession methodAnnotation = AnnotatedElementUtils.findMergedAnnotation(
+                handlerMethod.getMethod(), RequiresSession.class);
+        if (methodAnnotation != null) {
+            return methodAnnotation;
+        }
+        return AnnotatedElementUtils.findMergedAnnotation(
+                handlerMethod.getBeanType(), RequiresSession.class);
     }
 
     private RequiresPermission findAnnotation(HandlerMethod handlerMethod) {

@@ -51,7 +51,15 @@ Treat these as contracts, not implementation details — tests in `nap-it` and
 - **Cookie set and clear go through the same builder.** A browser matches a deletion on
   name + domain + path; a clear that omits `domain` leaves the cookie in place.
 - **`@RequiresPermission` over `@RequiresRole`.** RFC §15.1 and the annotation javadoc: role
-  guards invert the direction of change and fail silently when a new role is added.
+  guards invert the direction of change and fail silently when a new role is added. Use
+  `@RequiresSession` for "any logged-in user" rather than inventing a permission granted to
+  everyone.
+- **A handler declaring no NAP annotation is not guarded.** `NapSessionFilter` authenticates on
+  `nap.protected-path-prefixes` but falls through on a missing, unknown, or expired session
+  rather than rejecting, and `NapPermissionInterceptor` allows any handler that declares no
+  requirement. The prefix list means "authenticate here if you can", not "login required".
+  Whether the filter should fail closed is a separate, breaking decision — don't change it in
+  passing.
 
 ## Spring gotchas
 
