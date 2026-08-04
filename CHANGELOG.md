@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-08-04
+
+### Added
+
+- **`@RequiresSession`**, an authentication-only guard. The three existing annotations all
+  answer "which principal", so the only way to say "any logged-in user" was a placeholder
+  permission granted to everyone — a key in the registry that gates nothing and reads, to the
+  next person, as though it does. Enforcement is a fourth annotation lookup in
+  `NapPermissionInterceptor`; the 401 it needs was already there for the other guards.
+
+### Changed
+
+- Documented, in `README.md` and the new annotation's javadoc, that **a handler declaring no NAP
+  annotation is not guarded at all.** `NapSessionFilter` authenticates on
+  `nap.protected-path-prefixes` but falls through on a missing, unknown, or expired session
+  rather than rejecting, and the interceptor allows any handler that declares no requirement.
+  The prefix list means "authenticate here if you can", not "login required". Behaviour is
+  unchanged and a test now pins it; whether the filter should instead fail closed is a separate
+  and breaking decision.
+- `README.md` and `CLAUDE.md` rewritten against the current code: module table, the real
+  `/api/v1/auth/*` surface, Maven coordinates, configuration, and the filter registration the
+  auto-configuration deliberately leaves to the application.
+
 ## [0.5.0] - 2026-08-04
 
 ### Removed
