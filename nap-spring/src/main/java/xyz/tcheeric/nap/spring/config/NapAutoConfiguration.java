@@ -99,7 +99,13 @@ public class NapAutoConfiguration {
     // No NapServletFilter / NapSessionFilter bean here, deliberately: both are registered by
     // the application (usually through a FilterRegistrationBean, which ConditionalOnMissingBean
     // would not see), and a second registration would consume the request body twice. The
-    // matching knobs — nap.max-body-bytes, nap.protected-path-prefixes — are read at that site.
+    // matching knobs — nap.max-body-bytes, nap.protected-path-prefixes — are read at that site,
+    // so the registration has to pass them:
+    //
+    //     new NapServletFilter("/auth/complete", properties.maxBodyBytes())
+    //
+    // Neither filter has a constructor that defaults them, so leaving one out is a compile
+    // error rather than a configured value the app silently never applies.
 
     @Bean
     @ConditionalOnMissingBean

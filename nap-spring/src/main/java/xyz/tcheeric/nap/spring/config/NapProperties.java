@@ -1,6 +1,7 @@
 package xyz.tcheeric.nap.spring.config;
 
 import org.springframework.boot.context.properties.ConfigurationProperties;
+import xyz.tcheeric.nap.spring.filter.NapServletFilter;
 
 import java.util.List;
 
@@ -50,7 +51,7 @@ public record NapProperties(
         if (maxFailuresPerChallenge == null) maxFailuresPerChallenge = 5;
         if (minAuthResponseMillis == null) minAuthResponseMillis = 100;
         if (responseJitterMillis == null) responseJitterMillis = 25;
-        if (maxBodyBytes <= 0) maxBodyBytes = 1024;
+        if (maxBodyBytes <= 0) maxBodyBytes = NapServletFilter.DEFAULT_MAX_BODY_BYTES;
         if (challengeTtlSeconds <= 0) challengeTtlSeconds = 60;
         if (sessionTtlSeconds <= 0) sessionTtlSeconds = 3600;
         // New sliding-window knobs. If unset (i.e. the caller still uses the old

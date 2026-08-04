@@ -5,8 +5,10 @@ import org.junit.jupiter.api.Test;
 import org.springframework.mock.web.MockFilterChain;
 import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.mock.web.MockHttpServletResponse;
+import xyz.tcheeric.nap.spring.config.NapProperties;
 
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -23,7 +25,7 @@ class NapServletFilterTest {
         MockHttpServletRequest request = completeRequest(body);
         MockFilterChain chain = new MockFilterChain();
 
-        new NapServletFilter(COMPLETE_PATH).doFilter(request, new MockHttpServletResponse(), chain);
+        new NapServletFilter(COMPLETE_PATH, 1024).doFilter(request, new MockHttpServletResponse(), chain);
 
         assertThat((byte[]) request.getAttribute(NapServletFilter.RAW_BODY_ATTRIBUTE))
                 .isEqualTo(body.getBytes(StandardCharsets.UTF_8));
@@ -68,10 +70,31 @@ class NapServletFilterTest {
         MockHttpServletRequest request = new MockHttpServletRequest("POST", "/api/v1/auth/init");
         request.setContent("{\"npub\":\"npub1test\"}".getBytes(StandardCharsets.UTF_8));
 
-        new NapServletFilter(COMPLETE_PATH)
+        new NapServletFilter(COMPLETE_PATH, 1024)
                 .doFilter(request, new MockHttpServletResponse(), new MockFilterChain());
 
         assertThat(request.getAttribute(NapServletFilter.RAW_BODY_ATTRIBUTE)).isNull();
+    }
+
+    /**
+     * The filter takes its cap from the registration, and {@code nap.max-body-bytes} falls back
+     * to the filter's own constant when unset — so an app that leaves the property alone gets the
+     * documented 1 kB, and one that sets it gets what it set. The two used to be separate literals.
+     */
+    @Test
+    void unsetMaxBodyBytesFallsBackToTheFiltersDocumentedDefault() {
+        assertThat(propertiesWithMaxBodyBytes(0).maxBodyBytes())
+                .isEqualTo(NapServletFilter.DEFAULT_MAX_BODY_BYTES);
+        assertThat(propertiesWithMaxBodyBytes(4096).maxBodyBytes()).isEqualTo(4096);
+    }
+
+    private static NapProperties propertiesWithMaxBodyBytes(int maxBodyBytes) {
+        return new NapProperties(
+                true, "https://account.imani.casa",
+                60, 3600, 900, 43200, 30, 60, 600, 0, 300,
+                null, 0, 0, null, null, null, null, null, maxBodyBytes,
+                List.of("/internal/v1/merchants"),
+                new NapProperties.CookieProperties("session", true, true, "Lax", "/", "", 43200));
     }
 
     private static MockHttpServletRequest completeRequest(String body) {
