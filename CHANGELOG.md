@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.1] - 2026-08-19
+
+### Changed
+
+- Inherits dependency versions from `imani-bom` 0.1.45 instead of restating them
+  locally. A local pin on a BOM-managed artifact never fails the build, it just
+  silently wins, so the versions could drift apart with nothing reporting it.
 ## [0.6.0] - 2026-08-04
 
 ### Added
