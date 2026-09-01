@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.2] - 2026-09-01
+
+### Fixed
+
+- **`NapSessionFilter`'s ACL cache is keyed by principal and is now bounded.** It was keyed by
+  session id, so N sessions of one principal held N identical decisions, and nothing ever removed
+  an entry: neither revoke path did, and an abandoned session — browser closed, cookie discarded —
+  reaches no revoke path at all. The map grew with every sign-in the process had ever served. The
+  decision depends only on the principal, so keying it that way collapses a principal's sessions
+  to one entry, bounds cardinality by distinct principals, and makes a role change take effect
+  across all of a principal's sessions at once rather than drifting between them for up to a
+  refresh interval. An affirmative denial drops the entry alongside revoking the sessions, and a
+  size ceiling with a rate-limited sweep keeps an auto-provisioning resolver from growing the map
+  without limit. Not an authentication bypass: the session store and expiry are both consulted
+  ahead of the ACL, so a revoked or expired session was always rejected regardless of the cache.
+  ([#3](https://github.com/tcheeric/nap-java/issues/3))
+- **Only ACL grants are cached.** A denial the resolver is not certain about — an ACL it could
+  not read, a lagging replica, a row mid-rewrite — must cost the one request that hit the fault,
+  as `AclDecision` documents. Held in a per-principal cache it would instead have locked every
+  session the principal holds out for a full refresh interval. A denial the resolver *is* certain
+  about revokes the sessions, so its entry would never be read either.
+
 ## [0.6.1] - 2026-08-19
 
 ### Changed
