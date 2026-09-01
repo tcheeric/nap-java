@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **`AuthInitResponse` no longer breaks against a TypeScript server that advertises extensions.**
+  Jackson's default is to throw on an unknown property, so a Java client failed with
+  `UnrecognizedPropertyException` the moment the TypeScript side added `supported_extensions`
+  (nap#16). RFC §24.3 permits additive fields, but a field is only additive if the other
+  implementation tolerates it, so `ignoreUnknown` is part of the protocol contract here rather
+  than a Jackson preference.
+
+### Added
+
+- **`AuthInitResponse.supportedExtensions`**, mirroring the TypeScript field (nap#16, nap#29).
+  Serialised with `NON_NULL`: the TypeScript field is optional and *absence* means "the server
+  makes no claim", so emitting an explicit null would violate that type and would read as a
+  claim to a client testing for the key's presence. The six-argument constructor is retained, so
+  an additive protocol field does not become a breaking API change.
+
 ## [0.6.2] - 2026-09-01
 
 ### Fixed
