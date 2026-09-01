@@ -33,11 +33,22 @@ public class NapSessionFilter extends OncePerRequestFilter {
 
     private static final Logger log = LoggerFactory.getLogger(NapSessionFilter.class);
 
+    /**
+     * Ceiling on distinct principals held in {@link #aclCache}. Reaching it triggers a sweep of
+     * entries whose refresh deadline has passed; an auto-provisioning resolver otherwise leaves
+     * the principal set open-ended.
+     */
+    static final int MAX_CACHED_PRINCIPALS = 10_000;
+
     private final SessionStore sessionStore;
     private final AclResolver aclResolver;
     private final String cookieName;
     private final List<String> protectedPrefixes;
     private final Duration aclRefreshInterval;
+    /**
+     * Keyed by principal pubkey, which is what the cached decision actually depends on: N sessions
+     * of one principal collapse to one entry, and a role change lands on all of them together.
+     */
     private final Map<String, CachedAclDecision> aclCache = new ConcurrentHashMap<>();
 
     public NapSessionFilter(SessionStore sessionStore,
@@ -101,6 +112,7 @@ public class NapSessionFilter extends OncePerRequestFilter {
             // NIP-98 login for someone else's transient failure.
             if (aclDecision.revokeSessions()) {
                 sessionStore.revokeByPrincipal(record.principalPubkey(), Instant.now().getEpochSecond());
+                aclCache.remove(record.principalPubkey());
             }
             response.setStatus(HttpServletResponse.SC_FORBIDDEN);
             return;
@@ -135,17 +147,25 @@ public class NapSessionFilter extends OncePerRequestFilter {
 
     private AclDecision resolveAcl(SessionRecord session) {
         long now = Instant.now().getEpochSecond();
-        CachedAclDecision cachedDecision = aclCache.get(session.sessionId());
+        CachedAclDecision cachedDecision = aclCache.get(session.principalPubkey());
         if (cachedDecision != null && cachedDecision.validUntilEpochSecond() > now) {
             return cachedDecision.decision();
         }
 
         AclDecision refreshedDecision = aclResolver.resolve(session.principalNpub(), session.principalPubkey());
-        aclCache.put(session.sessionId(), new CachedAclDecision(
+        if (aclCache.size() >= MAX_CACHED_PRINCIPALS) {
+            aclCache.entrySet().removeIf(e -> e.getValue().validUntilEpochSecond() <= now);
+        }
+        aclCache.put(session.principalPubkey(), new CachedAclDecision(
                 refreshedDecision,
                 now + aclRefreshInterval.toSeconds()
         ));
         return refreshedDecision;
+    }
+
+    /** Visible for tests: number of principals currently cached. */
+    int aclCacheSize() {
+        return aclCache.size();
     }
 
     /**

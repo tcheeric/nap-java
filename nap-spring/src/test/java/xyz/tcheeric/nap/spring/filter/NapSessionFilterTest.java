@@ -214,6 +214,45 @@ class NapSessionFilterTest {
         return request;
     }
 
+    @Test
+    void doFilterInternal_cachesOneDecisionPerPrincipalNotPerSession() throws Exception {
+        // Many sessions of one principal — separate tabs, devices — resolve the same ACL, so
+        // the cache holds one entry and the resolver is asked once.
+        NapSessionFilter filter = new NapSessionFilter(
+                sessionStore, aclResolver, "merchant_session",
+                List.of("/internal/v1/merchants"), Duration.ofMinutes(5)
+        );
+        when(aclResolver.resolve("npub1test", "a".repeat(64)))
+                .thenReturn(AclDecision.allowed(List.of("merchant"), List.of("read")));
+
+        for (int i = 0; i < 50; i++) {
+            String sessionId = "session-" + i;
+            when(sessionStore.getBySessionId(sessionId)).thenReturn(Optional.of(sessionRecord(sessionId)));
+            MockHttpServletRequest request =
+                    new MockHttpServletRequest("POST", "/internal/v1/merchants/test/suspend");
+            request.setCookies(new Cookie("merchant_session", sessionId));
+            filter.doFilterInternal(request, new MockHttpServletResponse(), (req, res) -> { });
+        }
+
+        verify(aclResolver, times(1)).resolve("npub1test", "a".repeat(64));
+        assertThat(filter.aclCacheSize()).isEqualTo(1);
+    }
+
+    private SessionRecord sessionRecord(String sessionId) {
+        long now = java.time.Instant.now().getEpochSecond();
+        return SessionRecord.create(
+                sessionId,
+                "challenge-123",
+                "access-token-123",
+                "npub1test",
+                "a".repeat(64),
+                List.of("merchant"),
+                List.of("read"),
+                now,
+                now + 3_600
+        );
+    }
+
     private SessionRecord sessionRecord() {
         long now = java.time.Instant.now().getEpochSecond();
         return SessionRecord.create(
