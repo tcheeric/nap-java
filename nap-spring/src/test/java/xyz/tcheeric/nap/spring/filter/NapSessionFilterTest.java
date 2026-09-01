@@ -238,6 +238,34 @@ class NapSessionFilterTest {
         assertThat(filter.aclCacheSize()).isEqualTo(1);
     }
 
+    @Test
+    void doFilterInternal_doesNotCacheADenialTheResolverIsUnsureOf() throws Exception {
+        // "Denied" because the ACL could not be read must cost the one request that hit the
+        // fault. Caching it would lock the principal out for a whole refresh interval, and
+        // because the cache is now per-principal that would take every session down with it.
+        SessionRecord session = sessionRecord();
+        when(sessionStore.getBySessionId("session-123")).thenReturn(Optional.of(session));
+        when(aclResolver.resolve(session.principalNpub(), session.principalPubkey()))
+                .thenReturn(AclDecision.denied("acl_unavailable"))
+                .thenReturn(AclDecision.allowed(List.of("merchant"), List.of("read")));
+
+        NapSessionFilter filter = new NapSessionFilter(
+                sessionStore, aclResolver, "merchant_session",
+                List.of("/internal/v1/merchants"), Duration.ofMinutes(5)
+        );
+        MockHttpServletResponse denied = new MockHttpServletResponse();
+        filter.doFilterInternal(request(), denied, (req, res) -> { });
+
+        AtomicReference<Authentication> retryAuth = new AtomicReference<>();
+        filter.doFilterInternal(request(), new MockHttpServletResponse(), (req, res) ->
+                retryAuth.set(SecurityContextHolder.getContext().getAuthentication()));
+
+        assertThat(denied.getStatus()).isEqualTo(403);
+        assertThat(retryAuth.get()).isNotNull();
+        assertThat(filter.aclCacheSize()).isEqualTo(1);
+        verify(aclResolver, times(2)).resolve(session.principalNpub(), session.principalPubkey());
+    }
+
     private SessionRecord sessionRecord(String sessionId) {
         long now = java.time.Instant.now().getEpochSecond();
         return SessionRecord.create(

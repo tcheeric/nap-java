@@ -25,6 +25,7 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Validates NAP session cookies on protected paths and populates Spring SecurityContext.
@@ -40,6 +41,13 @@ public class NapSessionFilter extends OncePerRequestFilter {
      */
     static final int MAX_CACHED_PRINCIPALS = 10_000;
 
+    /**
+     * Floor on the interval between sweeps. Without it a cache held at its ceiling by live
+     * traffic scans every entry on every miss, which is the load profile the ceiling exists
+     * to protect against.
+     */
+    private static final long MIN_SWEEP_INTERVAL_SECONDS = 1;
+
     private final SessionStore sessionStore;
     private final AclResolver aclResolver;
     private final String cookieName;
@@ -50,6 +58,7 @@ public class NapSessionFilter extends OncePerRequestFilter {
      * of one principal collapse to one entry, and a role change lands on all of them together.
      */
     private final Map<String, CachedAclDecision> aclCache = new ConcurrentHashMap<>();
+    private final AtomicLong lastSweepEpochSecond = new AtomicLong(Long.MIN_VALUE);
 
     public NapSessionFilter(SessionStore sessionStore,
                             AclResolver aclResolver,
@@ -153,14 +162,35 @@ public class NapSessionFilter extends OncePerRequestFilter {
         }
 
         AclDecision refreshedDecision = aclResolver.resolve(session.principalNpub(), session.principalPubkey());
-        if (aclCache.size() >= MAX_CACHED_PRINCIPALS) {
+        // Only a grant is cached. A denial the resolver is certain about revokes the principal's
+        // sessions, so the next request stops at the session store and the entry would never be
+        // read; a denial it is not certain about — a lagging replica, a row mid-rewrite — must
+        // not be held, or one unreadable lookup locks every session the principal holds out for
+        // a whole refresh interval instead of for the single request that hit the fault.
+        if (refreshedDecision.allowed() && admit(now)) {
+            aclCache.put(session.principalPubkey(), new CachedAclDecision(
+                    refreshedDecision,
+                    now + aclRefreshInterval.toSeconds()
+            ));
+        }
+        return refreshedDecision;
+    }
+
+    /**
+     * Whether a new principal may be cached, sweeping stale entries first. Declining to cache
+     * once the sweep cannot free room keeps the map bounded: correctness does not depend on the
+     * cache, only the resolver call rate does.
+     */
+    private boolean admit(long now) {
+        if (aclCache.size() < MAX_CACHED_PRINCIPALS) {
+            return true;
+        }
+        long lastSweep = lastSweepEpochSecond.get();
+        if (now - lastSweep >= MIN_SWEEP_INTERVAL_SECONDS
+                && lastSweepEpochSecond.compareAndSet(lastSweep, now)) {
             aclCache.entrySet().removeIf(e -> e.getValue().validUntilEpochSecond() <= now);
         }
-        aclCache.put(session.principalPubkey(), new CachedAclDecision(
-                refreshedDecision,
-                now + aclRefreshInterval.toSeconds()
-        ));
-        return refreshedDecision;
+        return aclCache.size() < MAX_CACHED_PRINCIPALS;
     }
 
     /** Visible for tests: number of principals currently cached. */
