@@ -4,7 +4,7 @@ Java implementation of the **Nostr Authentication Protocol (NAP) v2** — challe
 login with a NIP-98 signed event, server-side sessions, rotating refresh tokens, and
 role/permission ACLs. Framework-agnostic core, optional Spring Boot adapter.
 
-Requires Java 21. Current version: `0.6.1`.
+Requires Java 21. Current version: `0.6.2`.
 
 Versions are managed by `imani-bom`; consumers that import it should omit the
 version entirely. 0.6.0 added the authorization layer (`AclResolver`,
@@ -44,7 +44,7 @@ returns `429` with `Retry-After`.
 <dependency>
   <groupId>xyz.tcheeric</groupId>
   <artifactId>nap-spring</artifactId>
-  <version>0.6.1</version>
+  <version>0.6.2</version>
 </dependency>
 ```
 
