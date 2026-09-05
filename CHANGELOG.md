@@ -5,6 +5,42 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Rate limiting no longer collapses every caller into one bucket behind a proxy.**
+  `NapAuthController` passed `request.getRemoteAddr()` straight into `RateLimitKey`, whose javadoc
+  says `clientIp` is "resolved by the adapter's trust policy" — there was no policy. Behind a
+  reverse proxy `getRemoteAddr()` is the proxy for every caller, so `rate-limit-max-per-window`
+  requests from anyone locked out everyone: a denial of service an attacker gets for free, and one
+  that reads as the limiter doing its job. New `ClientIpResolver` seam, defaulting to the old
+  behaviour (correct with no proxy in front); set `nap.trusted-proxies` and it walks
+  `X-Forwarded-For` right to left to the first address a trusted hop observed. Deliberately not
+  reading the header by default: an unconditional read lets a caller mint a fresh bucket per
+  request, which removes the limit rather than fixing it.
+
+- **`EventReplayGuard.inMemory()` no longer grows without bound.** The map was only ever added to,
+  so a service authenticating steadily leaked memory for its whole lifetime, at a rate the caller
+  chose. Now bounded by a retention window sized from the NIP-98 clock-skew allowance: past that
+  the timestamp check rejects a replayed event on its own, so remembering its id buys nothing. The
+  no-arg overload is deprecated for removal; eviction is on-insert and rate-limited to once a
+  second, so the guard owns no thread.
+
+### Added
+
+- **`nap.require-annotation-on-protected-paths`** makes a NAP annotation mandatory for handlers
+  inside `nap.protected-path-prefixes`. A handler declaring nothing was reachable by anyone, which
+  is the documented default and defensible, but it is also the outcome of forgetting — a new
+  handler on a protected controller was exposed with nothing in the diff to show for it. On, an
+  undeclared handler is refused with `500` rather than served: no credential the caller could
+  present would help, because the endpoint never stated what it wants. Off by default, since it can
+  only break a working application.
+
+- **`@PublicEndpoint`** declares a handler deliberately reachable without a session. It enforces
+  nothing; it removes the ambiguity between "public on purpose" and "someone forgot", which is what
+  makes the mandate above reviewable.
+
 ## [0.7.0] - 2026-09-02
 
 ### Fixed

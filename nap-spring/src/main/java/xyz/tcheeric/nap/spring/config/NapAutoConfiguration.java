@@ -25,6 +25,7 @@ import xyz.tcheeric.nap.server.acl.PermissionRegistry;
 import xyz.tcheeric.nap.server.store.InMemoryChallengeStore;
 import xyz.tcheeric.nap.server.store.InMemorySessionStore;
 import xyz.tcheeric.nap.spring.AudienceResolver;
+import xyz.tcheeric.nap.spring.ClientIpResolver;
 import xyz.tcheeric.nap.spring.RawBodyExtractor;
 import xyz.tcheeric.nap.spring.controller.NapAuthController;
 import xyz.tcheeric.nap.spring.filter.NapPermissionInterceptor;
@@ -67,7 +68,12 @@ public class NapAutoConfiguration {
                 .challengeStore(challengeStore)
                 .sessionStore(sessionStore)
                 .aclResolver(aclResolver)
-                .eventReplayGuard(replayGuardProvider.getIfAvailable(EventReplayGuard::inMemory))
+                // Bounded, and sized from the same skew allowance the timestamp check uses:
+                // once an event is too old to be accepted, its id no longer needs remembering.
+                // The old unbounded default grew for the life of the process, at a rate the
+                // caller controls.
+                .eventReplayGuard(replayGuardProvider.getIfAvailable(
+                        () -> EventReplayGuard.inMemory(Math.max(1, properties.maxClockSkewSeconds()))))
                 // An application-supplied RateLimiter wins; otherwise the in-memory one at
                 // the configured window, unless nap.rate-limit-enabled=false opts out. That
                 // opt-out is deliberate: the response floor holds every unauthenticated
@@ -113,20 +119,38 @@ public class NapAutoConfiguration {
                                                NapProperties properties,
                                                com.fasterxml.jackson.databind.ObjectMapper objectMapper,
                                                ObjectProvider<AudienceResolver> audienceResolverProvider,
-                                               ObjectProvider<RawBodyExtractor> rawBodyExtractorProvider) {
-        // Both null unless the application supplies one; nap.external-base-url stays the
+                                               ObjectProvider<RawBodyExtractor> rawBodyExtractorProvider,
+                                               ObjectProvider<ClientIpResolver> clientIpResolverProvider) {
+        // All null unless the application supplies one; nap.external-base-url stays the
         // shorthand for the common case (RFC §20.2).
+        //
+        // The client-IP resolver defaults to getRemoteAddr(), which is correct only when nothing
+        // sits between the client and this process. Behind a proxy that address is the proxy's,
+        // so every caller shares one rate-limit bucket and thirty requests lock everyone out.
+        // nap.trusted-proxies is the shorthand: set it and the resolver walks X-Forwarded-For
+        // back to the first hop those proxies actually observed.
+        ClientIpResolver clientIpResolver = clientIpResolverProvider.getIfAvailable();
+        if (clientIpResolver == null && !properties.trustedProxies().isEmpty()) {
+            clientIpResolver = ClientIpResolver.forwardedFor(properties.trustedProxies());
+        }
         return new NapAuthController(napServer, sessionStore, properties, objectMapper,
                 audienceResolverProvider.getIfAvailable(),
-                rawBodyExtractorProvider.getIfAvailable());
+                rawBodyExtractorProvider.getIfAvailable(),
+                clientIpResolver);
     }
 
     @Bean
     @ConditionalOnMissingBean(name = "napPermissionInterceptor")
-    public HandlerInterceptor napPermissionInterceptor(ObjectProvider<PermissionRegistry> registryProvider) {
+    public HandlerInterceptor napPermissionInterceptor(ObjectProvider<PermissionRegistry> registryProvider,
+                                                      NapProperties properties) {
         // With a registry present, a permission declared stepUp is enforced everywhere it is
         // required, without @RequiresStepUp having to be repeated at every call site.
-        return new NapPermissionInterceptor(registryProvider.getIfAvailable());
+        //
+        // nap.require-annotation-on-protected-paths turns an undeclared handler under a protected
+        // prefix into a startup-visible error instead of an open endpoint.
+        return new NapPermissionInterceptor(registryProvider.getIfAvailable(),
+                properties.protectedPathPrefixes(),
+                properties.requireAnnotationOnProtectedPaths());
     }
 
     @Bean

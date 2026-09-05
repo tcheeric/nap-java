@@ -56,6 +56,8 @@ nap:
   session-absolute-ttl-seconds: 43200
   refresh-ttl-seconds: 0             # 0 = refresh disabled
   protected-path-prefixes: [/api/v1/merchant]
+  trusted-proxies: []                # see "Rate limiting behind a proxy" below
+  require-annotation-on-protected-paths: false
   cookie:
     name: merchant_session
 ```
@@ -83,6 +85,34 @@ distinguishes them.
 the interceptor only rejects handlers that declare a requirement — so a protected prefix means
 "authenticate here if you can", not "login required". `@RequiresSession` is how a handler says
 the latter.
+
+That default is defensible — the adapter cannot know which endpoints are meant to be public —
+but it is also what forgetting looks like, so a handler added to a protected controller without
+an annotation is exposed with nothing in the diff to show for it. Set
+`nap.require-annotation-on-protected-paths: true` to make the declaration mandatory inside
+`nap.protected-path-prefixes`: an undeclared handler there is refused with `500` (a wiring bug,
+not a caller error — no credential would help). Genuinely public endpoints stay expressible with
+`@PublicEndpoint("why")`, which states in the source what omission used to state only by accident.
+
+## Rate limiting behind a proxy
+
+The rate limiter counts against a client address, and by default that is `getRemoteAddr()` — the
+TCP peer. That is correct only when the client *is* the peer. Behind a reverse proxy the peer is
+the proxy, identical for every caller, so the whole client dimension collapses into one bucket:
+the first `rate-limit-max-per-window` requests exhaust it and everyone else is refused. An
+attacker gets that denial of service for free, and it looks like the limiter working.
+
+Reading `X-Forwarded-For` unconditionally is worse — any caller sets the header themselves and
+mints a fresh bucket per request — so the deployment has to say which hops it trusts:
+
+```yaml
+nap:
+  trusted-proxies: [10.0.0.1]   # addresses of YOUR proxies, not a CIDR of the internet
+```
+
+The resolver then walks `X-Forwarded-For` right to left and takes the first address none of those
+proxies wrote, which is the first one a hop you trust actually observed. Anything more involved
+(PROXY protocol, a CDN header) is a `ClientIpResolver` bean.
 
 ## Persistence
 
