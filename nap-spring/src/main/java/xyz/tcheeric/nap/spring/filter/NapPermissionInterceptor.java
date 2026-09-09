@@ -8,6 +8,7 @@ import org.springframework.web.method.HandlerMethod;
 import org.springframework.web.servlet.HandlerInterceptor;
 import xyz.tcheeric.nap.core.SessionRecord;
 import xyz.tcheeric.nap.server.acl.PermissionRegistry;
+import xyz.tcheeric.nap.spring.annotation.PublicEndpoint;
 import xyz.tcheeric.nap.spring.annotation.RequiresPermission;
 import xyz.tcheeric.nap.spring.annotation.RequiresRole;
 import xyz.tcheeric.nap.spring.annotation.RequiresSession;
@@ -17,6 +18,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.time.Instant;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -27,6 +29,21 @@ import java.util.stream.Collectors;
  * <p>All present declarations are checked, and all must pass. A permission the registry marks
  * {@code stepUp} implies {@link RequiresStepUp} without the annotation having to be repeated at
  * every call site — pass a {@link PermissionRegistry} to get that.
+ *
+ * <h2>Handlers carrying no annotation</h2>
+ *
+ * <p>By default an unannotated handler is not guarded: this interceptor only rejects handlers that
+ * declare a requirement. That is deliberate — an adapter cannot know which endpoints are meant to
+ * be public — but it makes the safe state the one you have to remember, and a handler added to a
+ * protected controller without an annotation is exposed silently, with nothing in the diff to
+ * show for it.
+ *
+ * <p>{@code nap.require-annotation-on-protected-paths=true} inverts that within
+ * {@code nap.protected-path-prefixes}: a handler under one of those prefixes must carry a NAP
+ * annotation or the request is refused with {@code 500}, not {@code 401}, because an endpoint
+ * whose access policy was never stated is a wiring mistake and not a caller error. Public
+ * endpoints inside a protected prefix stay expressible with {@link PublicEndpoint}, which says in
+ * the source what the missing annotation used to say only by omission.
  */
 public class NapPermissionInterceptor implements HandlerInterceptor {
 
@@ -34,13 +51,29 @@ public class NapPermissionInterceptor implements HandlerInterceptor {
     public static final String STEP_UP_TOKEN_HEADER = "X-Step-Up-Token";
 
     private final PermissionRegistry registry;
+    private final List<String> protectedPathPrefixes;
+    private final boolean requireAnnotationOnProtectedPaths;
 
     public NapPermissionInterceptor() {
         this(null);
     }
 
     public NapPermissionInterceptor(PermissionRegistry registry) {
+        this(registry, List.of(), false);
+    }
+
+    /**
+     * @param protectedPathPrefixes            paths within which an annotation is mandatory when
+     *                                         {@code requireAnnotationOnProtectedPaths} is set.
+     * @param requireAnnotationOnProtectedPaths fail closed on an undeclared handler rather than
+     *                                          letting it through.
+     */
+    public NapPermissionInterceptor(PermissionRegistry registry, List<String> protectedPathPrefixes,
+                                    boolean requireAnnotationOnProtectedPaths) {
         this.registry = registry;
+        this.protectedPathPrefixes = protectedPathPrefixes == null ? List.of()
+                : List.copyOf(protectedPathPrefixes);
+        this.requireAnnotationOnProtectedPaths = requireAnnotationOnProtectedPaths;
     }
 
     @Override
@@ -55,6 +88,13 @@ public class NapPermissionInterceptor implements HandlerInterceptor {
         RequiresSession sessionAnnotation = findSessionAnnotation(handlerMethod);
         if (permissionAnnotation == null && roleAnnotation == null && stepUpAnnotation == null
                 && sessionAnnotation == null) {
+            if (requiresExplicitDeclaration(request, handlerMethod)) {
+                // 500, not 401: no credential the caller could present would help, because the
+                // endpoint never said what it wants. Refusing loudly is what keeps a forgotten
+                // annotation from reading as "public".
+                response.setStatus(HttpServletResponse.SC_INTERNAL_SERVER_ERROR);
+                return false;
+            }
             return true;
         }
 
@@ -94,6 +134,34 @@ public class NapPermissionInterceptor implements HandlerInterceptor {
         }
 
         return true;
+    }
+
+    /**
+     * True when the handler sits under a protected prefix, declares nothing, and has not opted
+     * out with {@link PublicEndpoint}.
+     */
+    private boolean requiresExplicitDeclaration(HttpServletRequest request, HandlerMethod handler) {
+        if (!requireAnnotationOnProtectedPaths || protectedPathPrefixes.isEmpty()) {
+            return false;
+        }
+        if (AnnotatedElementUtils.findMergedAnnotation(handler.getMethod(), PublicEndpoint.class) != null
+                || AnnotatedElementUtils.findMergedAnnotation(handler.getBeanType(), PublicEndpoint.class) != null) {
+            return false;
+        }
+        String path = request.getRequestURI();
+        if (path == null) {
+            return false;
+        }
+        String contextPath = request.getContextPath();
+        if (contextPath != null && !contextPath.isEmpty() && path.startsWith(contextPath)) {
+            path = path.substring(contextPath.length());
+        }
+        for (String prefix : protectedPathPrefixes) {
+            if (prefix != null && !prefix.isBlank() && path.startsWith(prefix)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private boolean registryRequiresStepUp(String permission) {

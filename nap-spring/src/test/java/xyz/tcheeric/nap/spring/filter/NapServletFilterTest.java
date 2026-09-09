@@ -93,7 +93,9 @@ class NapServletFilterTest {
                 true, "https://account.imani.casa",
                 60, 3600, 900, 43200, 30, 60, 600, 0, 300,
                 null, 0, 0, null, null, null, null, null, maxBodyBytes,
+                List.of(), // trustedProxies
                 List.of("/internal/v1/merchants"),
+                false,
                 new NapProperties.CookieProperties("session", true, true, "Lax", "/", "", 43200));
     }
 

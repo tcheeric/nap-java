@@ -31,7 +31,20 @@ public record NapProperties(
         Integer minAuthResponseMillis,
         Integer responseJitterMillis,
         int maxBodyBytes,
+        // Addresses of the reverse proxies in front of this service. Empty (the default) means
+        // the rate limiter counts against the TCP peer, which is correct only when the client IS
+        // the peer. Behind a proxy the peer is the proxy, so every caller lands in one bucket and
+        // the configured budget locks out everyone at once. Setting this makes the adapter walk
+        // X-Forwarded-For back to the first address one of these hops observed; an entry that is
+        // NOT listed here is never believed, which is what stops a caller forging their own.
+        List<String> trustedProxies,
         List<String> protectedPathPrefixes,
+        // Fail closed on a handler under a protected prefix that declares no NAP annotation.
+        // Off by default because it can only break a working app, and an adapter cannot know
+        // which endpoints are meant to be public. On, a forgotten annotation is a 500 at the
+        // first request rather than an endpoint quietly serving anyone; @PublicEndpoint is how
+        // a genuinely public handler says so.
+        Boolean requireAnnotationOnProtectedPaths,
         CookieProperties cookie
 ) {
 
@@ -52,6 +65,7 @@ public record NapProperties(
         if (minAuthResponseMillis == null) minAuthResponseMillis = 100;
         if (responseJitterMillis == null) responseJitterMillis = 25;
         if (maxBodyBytes <= 0) maxBodyBytes = NapServletFilter.DEFAULT_MAX_BODY_BYTES;
+        if (trustedProxies == null) trustedProxies = List.of();
         if (challengeTtlSeconds <= 0) challengeTtlSeconds = 60;
         if (sessionTtlSeconds <= 0) sessionTtlSeconds = 3600;
         // New sliding-window knobs. If unset (i.e. the caller still uses the old
@@ -64,6 +78,7 @@ public record NapProperties(
         if (stepUpTtlSeconds <= 0) stepUpTtlSeconds = 600;
         if (aclRefreshIntervalSeconds <= 0) aclRefreshIntervalSeconds = 300;
         if (protectedPathPrefixes == null) protectedPathPrefixes = List.of();
+        if (requireAnnotationOnProtectedPaths == null) requireAnnotationOnProtectedPaths = Boolean.FALSE;
         if (cookie == null) cookie = new CookieProperties("merchant_session", true, true, "Lax", "/", "", 0);
         // Default cookie maxAge to the (effective) absolute session cap so the
         // browser retains the cookie for the full server-side lifetime.

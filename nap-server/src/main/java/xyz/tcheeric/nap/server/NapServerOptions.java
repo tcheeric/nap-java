@@ -81,7 +81,10 @@ public record NapServerOptions(
         private ChallengeStore challengeStore;
         private SessionStore sessionStore;
         private AclResolver aclResolver;
-        private EventReplayGuard eventReplayGuard = EventReplayGuard.inMemory();
+        // Bounded at the clock-skew allowance: an event older than that fails the timestamp
+        // check on its own, so remembering its id longer only grows the map.
+        private EventReplayGuard eventReplayGuard =
+                EventReplayGuard.inMemory(DEFAULT_MAX_CLOCK_SKEW_SECONDS);
         private RateLimiter rateLimiter;
         private boolean rateLimiterSet;
         private MetricsRecorder metrics = MetricsRecorder.noop();
@@ -142,7 +145,9 @@ public record NapServerOptions(
             if (challengeStore == null) throw new IllegalStateException("challengeStore is required");
             if (sessionStore == null) throw new IllegalStateException("sessionStore is required");
             if (aclResolver == null) aclResolver = new AllowAllAclResolver();
-            if (eventReplayGuard == null) eventReplayGuard = EventReplayGuard.inMemory();
+            if (eventReplayGuard == null) {
+                eventReplayGuard = EventReplayGuard.inMemory(Math.max(1, maxClockSkewSeconds));
+            }
             // Fail at wiring time rather than silently issuing a non-conformant challenge.
             if (challengeTtlSeconds < 1 || challengeTtlSeconds > MAX_CHALLENGE_TTL_SECONDS) {
                 throw new IllegalStateException(

@@ -67,7 +67,9 @@ class NapAuthControllerTest {
             null,   // minAuthResponseMillis
             null,   // responseJitterMillis
             0,      // maxBodyBytes
+            List.of(), // trustedProxies — none, so the limiter counts the TCP peer
             List.of("/internal/v1/merchants"),
+            false,  // requireAnnotationOnProtectedPaths
             cookie
         );
     }

@@ -14,6 +14,7 @@ import xyz.tcheeric.nap.core.SessionRecord;
 import xyz.tcheeric.nap.core.SessionStore;
 import xyz.tcheeric.nap.server.*;
 import xyz.tcheeric.nap.spring.AudienceResolver;
+import xyz.tcheeric.nap.spring.ClientIpResolver;
 import xyz.tcheeric.nap.spring.RawBodyExtractor;
 import xyz.tcheeric.nap.spring.config.NapProperties;
 import xyz.tcheeric.nap.spring.filter.NapServletFilter;
@@ -44,10 +45,18 @@ public class NapAuthController {
     private final ObjectMapper objectMapper;
     private final AudienceResolver audienceResolver;
     private final RawBodyExtractor rawBodyExtractor;
+    private final ClientIpResolver clientIpResolver;
 
     public NapAuthController(NapServer napServer, SessionStore sessionStore,
                              NapProperties properties, ObjectMapper objectMapper) {
-        this(napServer, sessionStore, properties, objectMapper, null, null);
+        this(napServer, sessionStore, properties, objectMapper, null, null, null);
+    }
+
+    public NapAuthController(NapServer napServer, SessionStore sessionStore,
+                             NapProperties properties, ObjectMapper objectMapper,
+                             AudienceResolver audienceResolver, RawBodyExtractor rawBodyExtractor) {
+        this(napServer, sessionStore, properties, objectMapper, audienceResolver, rawBodyExtractor,
+                null);
     }
 
     /**
@@ -56,9 +65,18 @@ public class NapAuthController {
      * @param rawBodyExtractor {@code null} for the default, the bytes {@link NapServletFilter}
      *                         captured.
      */
+    /**
+     * @param clientIpResolver {@code null} for the default, {@link ClientIpResolver#remoteAddr()}.
+     *                         Bind {@link ClientIpResolver#forwardedFor} when this service runs
+     *                         behind a proxy, or every caller shares one rate-limit bucket.
+     */
     public NapAuthController(NapServer napServer, SessionStore sessionStore,
                              NapProperties properties, ObjectMapper objectMapper,
-                             AudienceResolver audienceResolver, RawBodyExtractor rawBodyExtractor) {
+                             AudienceResolver audienceResolver, RawBodyExtractor rawBodyExtractor,
+                             ClientIpResolver clientIpResolver) {
+        this.clientIpResolver = clientIpResolver != null
+                ? clientIpResolver
+                : ClientIpResolver.remoteAddr();
         this.napServer = napServer;
         this.sessionStore = sessionStore;
         this.properties = properties;
@@ -84,7 +102,7 @@ public class NapAuthController {
         String authUrl = audienceResolver.resolve(request);
 
         IssueChallengeResult result = napServer.issueChallenge(new IssueChallengeInput(
-                npub != null ? npub : pubkey, authUrl, "POST", request.getRemoteAddr()));
+                npub != null ? npub : pubkey, authUrl, "POST", clientIpResolver.resolve(request)));
 
         return switch (result) {
             case IssueChallengeResult.Success s -> ResponseEntity.ok(Map.of(
@@ -119,7 +137,7 @@ public class NapAuthController {
         String authorization = resolveAuthorization(request, rawBody);
 
         VerifyCompletionOutcome outcome = napServer.verifyCompletion(new VerifyCompletionInput(
-                authorization, "POST", authUrl, rawBody, request.getRemoteAddr()));
+                authorization, "POST", authUrl, rawBody, clientIpResolver.resolve(request)));
 
         return switch (outcome) {
             case VerifyCompletionOutcome.Success s -> {
@@ -155,7 +173,7 @@ public class NapAuthController {
     @PostMapping("/refresh")
     public ResponseEntity<?> refresh(HttpServletRequest request, HttpServletResponse response) {
         RefreshSessionOutcome outcome = napServer.refreshSession(new RefreshSessionInput(
-                bearerToken(request), request.getRemoteAddr()));
+                bearerToken(request), clientIpResolver.resolve(request)));
 
         return switch (outcome) {
             case RefreshSessionOutcome.Success s -> {
