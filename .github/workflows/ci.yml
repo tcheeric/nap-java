@@ -264,8 +264,19 @@ jobs:
       # So this cache is what makes the job viable rather than merely quicker. The key
       # rolls per run so each run writes a fresh copy, and restore-keys lets it start
       # from the previous database and apply only the delta.
-      - name: Cache the NVD database
-        uses: actions/cache@v4
+      # Split restore and save rather than the combined actions/cache. The combined
+      # action saves in a post step that is skipped when the job fails, and this job
+      # fails whenever the scan finds something at or above the CVSS gate, which is its
+      # normal outcome rather than an error. So the 80 minute download was discarded
+      # every run and every run started cold: observed twice, 40 download-progress lines
+      # on a run that should have restored a database built an hour earlier.
+      #
+      # `save-always: true` on the combined action looks like the fix and is not. The
+      # action documents it as deprecated, "does not work as intended", and names this
+      # split as the supported approach.
+      - name: Restore the NVD database
+        id: nvd-cache
+        uses: actions/cache/restore@v4
         with:
           path: ~/.m2/repository/org/owasp/dependency-check-data
           key: nvd-${{ runner.os }}-${{ github.run_id }}
@@ -335,6 +346,23 @@ jobs:
             echo "Skipping the scan: without an API key the NVD update fails outright rather"
             echo "than running slowly, so there is nothing to scan against."
           fi
+
+      # The other half of the split cache. `always()` is the entire point: the scan step
+      # above exits non-zero whenever it finds something at or above the gate, and that
+      # is the outcome this job exists to produce. Saving only on success would keep
+      # discarding the database on exactly the runs that matter.
+      #
+      # No cache-hit guard, because the key embeds github.run_id and so can never match
+      # an existing entry: the restore always lands through restore-keys as a partial
+      # hit, and this always writes a fresh entry. That is deliberate rather than
+      # wasteful. The database is updated in place by each run, so the new entry holds
+      # the previous database plus today's delta, and the next run starts from it.
+      - name: Save the NVD database
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.m2/repository/org/owasp/dependency-check-data
+          key: nvd-${{ runner.os }}-${{ github.run_id }}
 
       - name: Upload Dependency-Check report
         if: always()
