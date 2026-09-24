@@ -5,6 +5,93 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Security fixes from an application-security audit. **Three of these change behaviour**, and
+one of them ends every live session on deploy. `NapProperties` is a record and gained a
+component, so its canonical constructor arity changed again.
+
+### Security
+
+- **The session cookie now carries the access token, not the session id** (#27). The cookie
+  was set with `session.sessionId()` and every read looked it up with `getBySessionId()`,
+  which made the session identifier the de facto bearer credential. `getByAccessToken()`
+  existed on `SessionStore`, was implemented by both stores, and had no production caller.
+
+  Three consequences, all now closed. Session ids are not treated as secrets elsewhere:
+  `DefaultNapServer` logs one on every refresh path, `NapSessionFilter` logs one on ACL
+  denial, and `redeemed_session_id` is persisted on the challenge row, so anyone with log
+  access held live credentials. Rotation never reached the credential, because
+  `rotateRefreshToken()` mints a new access token while the session id it replaced is
+  unchanged, so the value a browser presents was never rotated and the reuse-detection
+  design protected something the cookie path did not use. And the two implementations
+  disagreed on the wire: `nap` (TypeScript) writes `access_token` into the cookie and
+  authenticates with `getByAccessToken()`, so a cookie minted by one server could not be
+  read by the other, which `nap-it` covers as a supported configuration.
+
+  **Breaking:** live sessions hold a cookie that no longer authenticates, so deploying logs
+  everyone out once. No fallback to `getBySessionId()` is provided, deliberately: accepting
+  the old credential would keep the issue alive for as long as the fallback existed.
+
+- **The NIP-98 proof is read from `Authorization` and nowhere else** (#28). A fallback read
+  it from a `proof` field in the JSON body when the header was absent. It was JVM-only with
+  no RFC or TypeScript counterpart; it asked the NIP-98 `payload` hash to cover a field
+  containing the hash; it parsed attacker-controlled bytes a second time with different
+  semantics and a blanket catch, which is a parser-differential surface; and a credential in
+  a body is logged by anything that logs request payloads, which is why `/auth/refresh`
+  takes its token from a header.
+
+- **`protected-path-prefixes` fails closed** (#29).
+  `nap.require-annotation-on-protected-paths` now defaults to `true`, so a handler under a
+  protected prefix that declares no NAP annotation is refused rather than served to anyone.
+  `@PublicEndpoint` states in the source what omission used to state only by accident.
+
+  The filter and the interceptor also disagreed about what a path is: the filter matched the
+  raw `getRequestURI()` while the interceptor stripped the servlet context path first, so
+  under a non-empty context path the filter skipped authentication on requests the
+  interceptor believed were covered. Both now share one `pathWithinApplication()` helper.
+  The three unauthenticated fall-through branches emit `nap_guard_no_session` with a reason,
+  mirroring the TypeScript guards, so an operator can tell "nobody is calling this" from
+  "everybody is, without a session".
+
+  **Breaking:** an application relying on the previous default, with protected prefixes
+  configured and handlers deliberately unannotated, will see `500` until those handlers
+  declare `@PublicEndpoint` or a NAP annotation.
+
+- **No implicit allow-all authorization** (#30). The auto-configuration defaulted to
+  `AllowAllAclResolver`, which authorizes every principal who can prove key control and
+  reported nothing, so an operator could wire NAP, log in with their own key, see a session,
+  and ship with the authorization layer a no-op. There is now no default: supply an
+  `AclResolver`, or set `nap.allow-all-principals=true` to ask for the old behaviour
+  deliberately. The in-memory stores remain the default for local development but warn at
+  startup, naming the consequence that is a security one rather than only an availability
+  one, since `revokeByPrincipal()` reaches a single node.
+
+  **Breaking:** an application relying on the implicit allow-all will fail to start, with a
+  message naming the property and the alternative.
+
+- **The in-memory stores evict** (#31). Both only ever grew: states were rewritten in place
+  and revocations stamped, but nothing was removed, and both maps are filled by
+  unauthenticated traffic. Retention bounds are deliberate rather than plain expiry. A
+  challenge is kept until `resultCacheUntil` when set, because a redeemed challenge inside
+  that window is what makes a client retry idempotent under RFC §13.3. A session is kept
+  until its absolute cap or `refreshExpiresAt`, whichever is later, because
+  `getByRefreshToken` answers for revoked sessions so a replay stays detectable, and
+  evicting earlier would turn a detected reuse into an unknown token.
+
+### Added
+
+- **CI** (#32). The repository had no `.github` directory: nothing built, tested, or scanned
+  on a pull request. Both interop tests call `assumeTrue` on a hard-coded
+  `~/IdeaProjects/nap`, and an assumption *skips* rather than fails, so a naive job would
+  have reported green while the one test asserting cross-implementation agreement asserted
+  nothing. The workflow clones the reference implementation, installs it, and asserts every
+  vector file is present before running. `TypeScriptClientInteropTest` now takes
+  `-Dnap.typescript.dir` rather than hard-coding a home-relative path.
+
+- CodeQL analysis, and OWASP Dependency-Check reporting without blocking until it has run
+  green on a runner.
+
 ## [0.8.0] - 2026-09-06
 
 Minor rather than patch: `NapProperties` is a record and gained two components, so its canonical
