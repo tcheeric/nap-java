@@ -212,7 +212,7 @@ class NapAuthControllerTest {
         sessionStore.createForChallenge(expired);
 
         MockHttpServletRequest request = new MockHttpServletRequest("GET", "/api/v1/auth/session");
-        request.setCookies(new Cookie("merchant_session", "sid-expired"));
+        request.setCookies(new Cookie("merchant_session", "token"));
 
         ResponseEntity<?> response = controller().checkSession(request);
 
@@ -234,7 +234,7 @@ class NapAuthControllerTest {
         sessionStore.createForChallenge(active);
 
         MockHttpServletRequest request = new MockHttpServletRequest("GET", "/api/v1/auth/session");
-        request.setCookies(new Cookie("merchant_session", "sid-shape"));
+        request.setCookies(new Cookie("merchant_session", "token-secret"));
 
         ResponseEntity<?> response = controller().checkSession(request);
 
@@ -278,7 +278,7 @@ class NapAuthControllerTest {
         sessionStore.createForChallenge(active);
 
         MockHttpServletRequest request = new MockHttpServletRequest("GET", "/api/v1/auth/session");
-        request.setCookies(new Cookie("merchant_session", "sid-active"));
+        request.setCookies(new Cookie("merchant_session", "token-a"));
 
         ResponseEntity<?> response = controller().checkSession(request);
 
@@ -314,7 +314,7 @@ class NapAuthControllerTest {
         sessionStore.createForChallenge(narrow);
 
         MockHttpServletRequest request = new MockHttpServletRequest("GET", "/api/v1/auth/session");
-        request.setCookies(new Cookie("merchant_session", "sid-narrow"));
+        request.setCookies(new Cookie("merchant_session", "token-n"));
 
         ResponseEntity<?> response = controller().checkSession(request);
 
@@ -377,7 +377,7 @@ class NapAuthControllerTest {
         assertThat(result.getStatusCode().value()).isEqualTo(200);
         Cookie cookie = response.getCookie("merchant_session");
         assertThat(cookie).isNotNull();
-        assertThat(cookie.getValue()).isEqualTo("sid-rotated");
+        assertThat(cookie.getValue()).isEqualTo("access-2");
         assertThat(cookie.getMaxAge()).isEqualTo(43200);
 
         var captor = forClass(RefreshSessionInput.class);
@@ -401,7 +401,7 @@ class NapAuthControllerTest {
         sessionStore.createForChallenge(live);
 
         MockHttpServletRequest request = new MockHttpServletRequest("POST", "/api/v1/auth/logout");
-        request.setCookies(new Cookie("merchant_session", "sid-live"));
+        request.setCookies(new Cookie("merchant_session", "token-l"));
         MockHttpServletResponse response = new MockHttpServletResponse();
 
         ResponseEntity<Void> result = controller().logout(request, response);
@@ -410,8 +410,134 @@ class NapAuthControllerTest {
         Cookie cookie = response.getCookie("merchant_session");
         assertThat(cookie).isNotNull();
         assertThat(cookie.getMaxAge()).isEqualTo(0);
-        // Session is revoked in the store — subsequent getBySessionId filters it out.
+        // Revoked in the store, so the session is gone by its own id as well as by the
+        // access token the cookie carried.
         assertThat(sessionStore.getBySessionId("sid-live")).isEmpty();
+    }
+
+    // -----------------------------------------------------------------
+    // The cookie carries the access token, never the session id (#27)
+    // -----------------------------------------------------------------
+
+    /**
+     * The session id and the access token are not interchangeable. The id is an identifier:
+     * it is logged on the refresh paths, logged on ACL denial, and persisted on the challenge
+     * row. The access token is the credential, and it is what rotation replaces. Putting the
+     * id in the cookie made every log line naming a session a live credential, and meant the
+     * value a browser presents was never rotated.
+     */
+    @Test
+    void complete_cookieCarriesTheAccessTokenNotTheSessionId() {
+        MockHttpServletRequest request = new MockHttpServletRequest("POST", "/api/v1/auth/complete");
+        request.setAttribute(NapServletFilter.RAW_BODY_ATTRIBUTE, "{\"challenge_id\":\"c\"}".getBytes());
+        request.addHeader("Authorization", "Nostr proof");
+        MockHttpServletResponse response = new MockHttpServletResponse();
+
+        long now = 1_700_000_000L;
+        SessionRecord session = SessionRecord.create(
+                "sid-secret", "c", "access-token-secret",
+                "npub1test", "a".repeat(64),
+                List.of(), List.of(),
+                now, now, now + 900, now + 43200
+        );
+        when(napServer.verifyCompletion(any())).thenReturn(VerifyCompletionOutcome.success(session));
+        when(napServer.toPublicAuthSuccess(session)).thenReturn(new AuthSuccessResponse(
+                "ok", session.accessToken(), "Bearer",
+                session.expiresAt(), session.absoluteExpiryAt(),
+                new AuthSuccessResponse.Principal(session.principalNpub(), session.principalPubkey()),
+                session.roles(), session.permissions()
+        ));
+
+        controller().complete(request, response);
+
+        Cookie cookie = response.getCookie("merchant_session");
+        assertThat(cookie).isNotNull();
+        assertThat(cookie.getValue()).isEqualTo("access-token-secret");
+        assertThat(cookie.getValue()).isNotEqualTo("sid-secret");
+    }
+
+    /** A cookie carrying the session id must no longer authenticate anything. */
+    @Test
+    void checkSession_rejectsACookieCarryingTheSessionId() {
+        long now = Instant.now().getEpochSecond();
+        SessionRecord live = SessionRecord.create(
+                "sid-rejected", "chal", "access-token-rejected",
+                "npub", "a".repeat(64),
+                List.of(), List.of(),
+                now - 60, now - 60, now + 900, now + 43200
+        );
+        sessionStore.createForChallenge(live);
+
+        MockHttpServletRequest request = new MockHttpServletRequest("GET", "/api/v1/auth/session");
+        request.setCookies(new Cookie("merchant_session", "sid-rejected"));
+
+        ResponseEntity<?> response = controller().checkSession(request);
+
+        assertThat(response.getStatusCode().value()).isEqualTo(401);
+    }
+
+    /**
+     * Rotation mints a new access token, and the cookie carries it, so the credential the
+     * browser held before the refresh stops working. That is the property the rotating-token
+     * design exists for and the one the session-id cookie silently removed.
+     */
+    @Test
+    void refresh_retiresThePreviousCookieValue() {
+        long now = Instant.now().getEpochSecond();
+        SessionRecord before = SessionRecord.create(
+                "sid-rot", "chal-r", "access-before",
+                "npub-r", "f".repeat(64),
+                List.of(), List.of(),
+                now - 60, now - 60, now + 900, now + 43200
+        );
+        sessionStore.createForChallenge(before);
+
+        SessionRecord after = SessionRecord.create(
+                "sid-rot", "chal-r", "access-after",
+                "npub-r", "f".repeat(64),
+                List.of(), List.of(),
+                now - 60, now, now + 900, now + 43200
+        );
+        when(napServer.refreshSession(any())).thenReturn(new RefreshSessionOutcome.Success(after));
+        when(napServer.toPublicAuthSuccess(after)).thenReturn(new AuthSuccessResponse(
+                "ok", after.accessToken(), "Bearer",
+                after.expiresAt(), after.absoluteExpiryAt(),
+                new AuthSuccessResponse.Principal(after.principalNpub(), after.principalPubkey()),
+                after.roles(), after.permissions()
+        ));
+
+        MockHttpServletRequest request = new MockHttpServletRequest("POST", "/api/v1/auth/refresh");
+        request.addHeader("Authorization", "Bearer refresh-1");
+        MockHttpServletResponse response = new MockHttpServletResponse();
+
+        controller().refresh(request, response);
+
+        Cookie cookie = response.getCookie("merchant_session");
+        assertThat(cookie).isNotNull();
+        assertThat(cookie.getValue()).isEqualTo("access-after");
+        assertThat(cookie.getValue()).isNotEqualTo("access-before");
+    }
+
+    /** Logout resolves the cookie to a session before revoking, so a 204 really did revoke. */
+    @Test
+    void logout_revokesTheSessionTheAccessTokenNames() {
+        long now = Instant.now().getEpochSecond();
+        SessionRecord live = SessionRecord.create(
+                "sid-bye", "chal-b", "access-bye",
+                "npub-b", "a".repeat(64),
+                List.of(), List.of(),
+                now - 60, now - 60, now + 900, now + 43200
+        );
+        sessionStore.createForChallenge(live);
+
+        MockHttpServletRequest request = new MockHttpServletRequest("POST", "/api/v1/auth/logout");
+        request.setCookies(new Cookie("merchant_session", "access-bye"));
+        MockHttpServletResponse response = new MockHttpServletResponse();
+
+        ResponseEntity<Void> result = controller().logout(request, response);
+
+        assertThat(result.getStatusCode().value()).isEqualTo(204);
+        assertThat(sessionStore.getBySessionId("sid-bye")).isEmpty();
     }
 
     /**

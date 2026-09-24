@@ -89,13 +89,19 @@ public class NapSessionFilter extends OncePerRequestFilter {
             return;
         }
 
-        String sessionId = extractCookie(request);
-        if (sessionId == null) {
+        // The cookie carries the access token, not the session id. The two are not
+        // interchangeable: the session id is an identifier that appears in logs and on
+        // challenge rows, while the access token is the credential rotation replaces on
+        // every refresh. Authenticating on the identifier would mean the value a browser
+        // presents is never rotated, and that every log line naming a session is a live
+        // credential.
+        String accessToken = extractCookie(request);
+        if (accessToken == null) {
             filterChain.doFilter(request, response);
             return;
         }
 
-        var session = sessionStore.getBySessionId(sessionId);
+        var session = sessionStore.getByAccessToken(accessToken);
 
         if (session.isEmpty()) {
             filterChain.doFilter(request, response);

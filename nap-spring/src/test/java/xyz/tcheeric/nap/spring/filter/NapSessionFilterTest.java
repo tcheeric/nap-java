@@ -43,7 +43,7 @@ class NapSessionFilterTest {
     @Test
     void doFilterInternal_deniesSuspendedSessions() throws Exception {
         SessionRecord session = sessionRecord();
-        when(sessionStore.getBySessionId("session-123")).thenReturn(Optional.of(session));
+        when(sessionStore.getByAccessToken("access-token-123")).thenReturn(Optional.of(session));
         when(aclResolver.resolve(session.principalNpub(), session.principalPubkey()))
                 .thenReturn(AclDecision.denied("suspended", true));
 
@@ -62,7 +62,7 @@ class NapSessionFilterTest {
         // replica, a row mid-rewrite — blocks this request and no more. Revoking would cost
         // the user a fresh NIP-98 login for someone else's transient failure.
         SessionRecord session = sessionRecord();
-        when(sessionStore.getBySessionId("session-123")).thenReturn(Optional.of(session));
+        when(sessionStore.getByAccessToken("access-token-123")).thenReturn(Optional.of(session));
         when(aclResolver.resolve(session.principalNpub(), session.principalPubkey()))
                 .thenReturn(AclDecision.denied("acl_unavailable"));
 
@@ -91,7 +91,7 @@ class NapSessionFilterTest {
     @Test
     void doFilterInternal_cachesAclRefreshesForTheConfiguredInterval() throws Exception {
         SessionRecord session = sessionRecord();
-        when(sessionStore.getBySessionId("session-123")).thenReturn(Optional.of(session));
+        when(sessionStore.getByAccessToken("access-token-123")).thenReturn(Optional.of(session));
         when(aclResolver.resolve(session.principalNpub(), session.principalPubkey()))
                 .thenReturn(AclDecision.allowed(List.of("admin"), List.of("admin", "read")));
 
@@ -167,7 +167,7 @@ class NapSessionFilterTest {
                 List.of("merchant"), List.of("read"),
                 now - 7200, now - 3600  // expired 1 hour ago
         );
-        when(sessionStore.getBySessionId("session-123")).thenReturn(Optional.of(expired));
+        when(sessionStore.getByAccessToken("access-token-123")).thenReturn(Optional.of(expired));
 
         NapSessionFilter filter = new NapSessionFilter(
                 sessionStore, aclResolver, "merchant_session",
@@ -189,7 +189,7 @@ class NapSessionFilterTest {
     @Test
     void doFilterInternal_sessionNotFound_passesThrough() throws Exception {
         // Arrange
-        when(sessionStore.getBySessionId("session-123")).thenReturn(Optional.empty());
+        when(sessionStore.getByAccessToken("access-token-123")).thenReturn(Optional.empty());
 
         NapSessionFilter filter = new NapSessionFilter(
                 sessionStore, aclResolver, "merchant_session",
@@ -210,7 +210,7 @@ class NapSessionFilterTest {
 
     private MockHttpServletRequest request() {
         MockHttpServletRequest request = new MockHttpServletRequest("POST", "/internal/v1/merchants/test/suspend");
-        request.setCookies(new Cookie("merchant_session", "session-123"));
+        request.setCookies(new Cookie("merchant_session", "access-token-123"));
         return request;
     }
 
@@ -227,10 +227,12 @@ class NapSessionFilterTest {
 
         for (int i = 0; i < 50; i++) {
             String sessionId = "session-" + i;
-            when(sessionStore.getBySessionId(sessionId)).thenReturn(Optional.of(sessionRecord(sessionId)));
+            String accessToken = "access-token-" + i;
+            when(sessionStore.getByAccessToken(accessToken))
+                    .thenReturn(Optional.of(sessionRecord(sessionId, accessToken)));
             MockHttpServletRequest request =
                     new MockHttpServletRequest("POST", "/internal/v1/merchants/test/suspend");
-            request.setCookies(new Cookie("merchant_session", sessionId));
+            request.setCookies(new Cookie("merchant_session", accessToken));
             filter.doFilterInternal(request, new MockHttpServletResponse(), (req, res) -> { });
         }
 
@@ -244,7 +246,7 @@ class NapSessionFilterTest {
         // fault. Caching it would lock the principal out for a whole refresh interval, and
         // because the cache is now per-principal that would take every session down with it.
         SessionRecord session = sessionRecord();
-        when(sessionStore.getBySessionId("session-123")).thenReturn(Optional.of(session));
+        when(sessionStore.getByAccessToken("access-token-123")).thenReturn(Optional.of(session));
         when(aclResolver.resolve(session.principalNpub(), session.principalPubkey()))
                 .thenReturn(AclDecision.denied("acl_unavailable"))
                 .thenReturn(AclDecision.allowed(List.of("merchant"), List.of("read")));
@@ -266,12 +268,17 @@ class NapSessionFilterTest {
         verify(aclResolver, times(2)).resolve(session.principalNpub(), session.principalPubkey());
     }
 
-    private SessionRecord sessionRecord(String sessionId) {
+    /**
+     * A session of the shared principal, with its own id and its own access token. Distinct
+     * tokens are what make the per-principal cache assertion meaningful: N sessions now look
+     * up N different credentials and must still collapse to one cache entry.
+     */
+    private SessionRecord sessionRecord(String sessionId, String accessToken) {
         long now = java.time.Instant.now().getEpochSecond();
         return SessionRecord.create(
                 sessionId,
                 "challenge-123",
-                "access-token-123",
+                accessToken,
                 "npub1test",
                 "a".repeat(64),
                 List.of("merchant"),

@@ -141,7 +141,7 @@ public class NapAuthController {
 
         return switch (outcome) {
             case VerifyCompletionOutcome.Success s -> {
-                setCookie(response, s.session().sessionId());
+                setCookie(response, s.session());
                 var successResponse = napServer.toPublicAuthSuccess(s.session());
                 yield ResponseEntity.ok(successResponse);
             }
@@ -177,10 +177,11 @@ public class NapAuthController {
 
         return switch (outcome) {
             case RefreshSessionOutcome.Success s -> {
-                // The session id is unchanged by a rotation, but re-setting the cookie renews
-                // its Max-Age — otherwise a session that keeps refreshing still loses its
-                // cookie at the original absolute cap.
-                setCookie(response, s.session().sessionId());
+                // Re-set because rotation mints a new access token: the cookie carries that
+                // token, so a rotation the browser never learns about would leave it holding
+                // the retired one. Renewing Max-Age at the same time is what stops a session
+                // that keeps refreshing from losing its cookie at the original absolute cap.
+                setCookie(response, s.session());
                 yield ResponseEntity.ok(napServer.toPublicAuthSuccess(s.session()));
             }
             case RefreshSessionOutcome.Failure f when f.code() == NapErrorCode.NAP_REFRESH_RATE_LIMITED ->
@@ -227,12 +228,12 @@ public class NapAuthController {
      */
     @GetMapping("/session")
     public ResponseEntity<?> checkSession(HttpServletRequest request) {
-        String sessionId = extractCookie(request);
-        if (sessionId == null) {
+        String accessToken = extractCookie(request);
+        if (accessToken == null) {
             return sessionEnded("invalid");
         }
 
-        SessionRecord record = sessionStore.getBySessionId(sessionId).orElse(null);
+        SessionRecord record = sessionStore.getByAccessToken(accessToken).orElse(null);
         if (record == null) {
             return sessionEnded("invalid");
         }
@@ -274,10 +275,15 @@ public class NapAuthController {
 
     @PostMapping("/logout")
     public ResponseEntity<Void> logout(HttpServletRequest request, HttpServletResponse response) {
-        String sessionId = extractCookie(request);
-        if (sessionId != null) {
-            sessionStore.revokeBySessionId(sessionId, Instant.now().getEpochSecond());
-            log.info("nap_logout");
+        String accessToken = extractCookie(request);
+        if (accessToken != null) {
+            // Resolved to a session first: the cookie carries the access token, and revocation
+            // is keyed by session id. A revoke taking the cookie value directly would silently
+            // match nothing and return 204 without ending the session.
+            sessionStore.getByAccessToken(accessToken).ifPresent(record -> {
+                sessionStore.revokeBySessionId(record.sessionId(), Instant.now().getEpochSecond());
+                log.info("nap_logout");
+            });
         }
         clearCookie(response);
         return ResponseEntity.noContent().build();
@@ -288,8 +294,8 @@ public class NapAuthController {
                 .body(Map.of("error", "session_ended", "reason", reason));
     }
 
-    private void setCookie(HttpServletResponse response, String sessionId) {
-        response.addCookie(sessionCookie(sessionId, properties.cookie().maxAgeSeconds()));
+    private void setCookie(HttpServletResponse response, SessionRecord session) {
+        response.addCookie(sessionCookie(session.accessToken(), properties.cookie().maxAgeSeconds()));
     }
 
     private void clearCookie(HttpServletResponse response) {
