@@ -141,12 +141,20 @@ jobs:
       # CVSS >= 7 is the opening gate. A scanner developers learn to ignore has negative
       # value, so tighten only once the baseline is known clean.
       #
-      # The NVD API key is passed only when the secret is actually set. Passing an empty
-      # -DnvdApiKey= is not equivalent to omitting it: the plugin rejects it outright with
-      # "Invalid API Key, length of 0", verified locally against dependency-check 13.0.0.
-      # Without a key the NVD feed is rate limited to roughly one request per six seconds,
-      # so the first run is slow rather than broken. Set the NVD_API_KEY repository secret
-      # (free from https://nvd.nist.gov/developers/request-an-api-key) to make it fast.
+      # An NVD API key is required, not merely an optimisation. An earlier version of this
+      # comment claimed a missing key meant "slow rather than broken"; the first run on a
+      # runner disproved that, failing in 52s with "Invalid API Key, length of 0 too short".
+      # Reproduced locally against an empty data directory: the keyless run fails the same
+      # way whether NVD_API_KEY is empty or entirely unset, so it is the absent key rather
+      # than the empty string that breaks it. The message is misleading, since it describes
+      # key masking rather than the rejected request underneath. The legacy 1.1 JSON feeds
+      # are not a way around it either: nvd.nist.gov now answers those with 403.
+      #
+      # So the job skips with an explanation instead of failing red on every PR until the
+      # secret exists. A permanently red check that everyone knows to ignore trains people
+      # to ignore the scanner, which is worse than not running it. Get a free key at
+      # https://nvd.nist.gov/developers/request-an-api-key and add it as the NVD_API_KEY
+      # repository secret, and this becomes a real scan on the next run.
       - name: Run Dependency-Check
         env:
           NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
@@ -155,8 +163,9 @@ jobs:
             mvn -B -ntp org.owasp:dependency-check-maven:check \
               -DfailBuildOnCVSS=7 -DnvdApiKey="$NVD_API_KEY"
           else
-            echo "NVD_API_KEY is not set: falling back to the rate limited public NVD feed."
-            mvn -B -ntp org.owasp:dependency-check-maven:check -DfailBuildOnCVSS=7
+            echo "::warning title=Dependency-Check skipped::NVD_API_KEY secret is not set, so the NVD database cannot be built and no scan ran. Add the secret (free key: https://nvd.nist.gov/developers/request-an-api-key) to enable this job."
+            echo "Skipping the scan: without an API key the NVD update fails outright rather"
+            echo "than running slowly, so there is nothing to scan against."
           fi
 
       - name: Upload Dependency-Check report

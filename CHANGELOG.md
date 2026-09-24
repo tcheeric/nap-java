@@ -46,6 +46,26 @@ turns an unannotated handler under a protected prefix into a `500`.
   a body is logged by anything that logs request payloads, which is why `/auth/refresh`
   takes its token from a header.
 
+- **A partial `nap.cookie.*` config no longer strips `HttpOnly` and `Secure`.** `httpOnly`
+  and `secure` were primitive `boolean` on the `CookieProperties` record, so Spring bound
+  them as `false` the moment any sibling property was present. Setting only
+  `nap.cookie.name`, the most ordinary reason to touch that section, produced a session
+  cookie readable by script and sent in clear over http. Only the all-absent case reached
+  the intended defaults, which is why no existing test caught it: a hand-constructed
+  `NapProperties` took that branch and looked correct. Both are now boxed `Boolean`
+  defaulting to `true`, so absent is distinguishable from explicitly `false`, and an
+  explicit `false` is still honoured for local http development.
+
+  Found by CodeQL on the first CI run of this branch, not by the audit. It is the same
+  defect as `nap` (TypeScript) #34, in the language where the type system hid it.
+
+- **The guard log escapes line breaks in the request path** (`NapSessionFilter`). The path
+  is the one attacker-chosen field on that line, and a newline lets a caller forge a second
+  entry that looks like ours. Not reachable through Tomcat, which leaves `%0D%0A` encoded
+  through `getRequestURI()` (verified, not assumed), but that is the container's guarantee
+  rather than this filter's, and it does not survive a different container or a rewritten
+  URI.
+
 - **`protected-path-prefixes` fails closed** (#29).
   `nap.require-annotation-on-protected-paths` now defaults to `true`, so a handler under a
   protected prefix that declares no NAP annotation is refused rather than served to anyone.

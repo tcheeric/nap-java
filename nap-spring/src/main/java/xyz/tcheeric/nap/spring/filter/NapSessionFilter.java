@@ -161,9 +161,32 @@ public class NapSessionFilter extends OncePerRequestFilter {
             throws ServletException, IOException {
         if (log.isDebugEnabled()) {
             log.debug("nap_guard_no_session reason={} path={} pubkey={}",
-                    reason, pathWithinApplication(request), pubkey);
+                    reason, forLog(pathWithinApplication(request)), pubkey);
         }
         filterChain.doFilter(request, response);
+    }
+
+    /**
+     * Strips line breaks from a value before it reaches the log.
+     *
+     * <p>The path is the one field here an attacker chooses. {@code reason} is a literal and
+     * {@code pubkey} comes from the session store, but the URI is whatever was requested, and
+     * a newline in a log line lets a caller append a second line that looks like ours: a
+     * forged {@code nap_guard_no_session} entry naming someone else's pubkey, or a fabricated
+     * success hiding a real refusal. Log analysis is parsed by line, so this is a truthfulness
+     * problem for the audit trail rather than an availability one.
+     *
+     * <p>Not reachable through Tomcat today, which rejects raw CR/LF in the request line and
+     * leaves {@code %0D%0A} percent-encoded through {@code getRequestURI()}. Verified, not
+     * assumed. The escaping belongs here anyway: that safety is the container's decision, not
+     * this filter's, and it does not survive a different servlet container, a forwarded or
+     * rewritten URI, or a future caller passing an already-decoded path.
+     */
+    private static String forLog(String value) {
+        if (value == null) {
+            return null;
+        }
+        return value.replace('\r', '_').replace('\n', '_');
     }
 
     /**
