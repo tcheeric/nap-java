@@ -82,8 +82,16 @@ class NapAuthControllerTest {
         return new NapAuthController(napServer, sessionStore, props, objectMapper);
     }
 
+    /**
+     * A proof in the body is not a credential this server accepts (#28).
+     *
+     * <p>The fallback that read it there was JVM-only, had no RFC or TypeScript counterpart, and
+     * asked the NIP-98 {@code payload} hash to cover a field that contains the hash. Asserting a
+     * <em>valid-looking</em> proof is refused is the point: a malformed one would be rejected
+     * whether or not the fallback existed.
+     */
     @Test
-    void complete_usesBodyProofWhenAuthorizationHeaderIsMissing() {
+    void complete_doesNotAcceptAProofCarriedInTheBody() {
         String requestBody = """
                 {"challenge_id":"challenge-123","proof":"Nostr legacy-proof"}
                 """;
@@ -91,32 +99,20 @@ class NapAuthControllerTest {
         request.setAttribute(NapServletFilter.RAW_BODY_ATTRIBUTE, requestBody.getBytes());
         MockHttpServletResponse response = new MockHttpServletResponse();
 
-        long now = 1_700_000_000L;
-        SessionRecord session = SessionRecord.create(
-                "session-1", "challenge-123", "access-token",
-                "npub1test", "a".repeat(64),
-                List.of("merchant"), List.of("read"),
-                now, now, now + 900, now + 43200
-        );
-        when(napServer.verifyCompletion(any())).thenReturn(VerifyCompletionOutcome.success(session));
-        when(napServer.toPublicAuthSuccess(session)).thenReturn(new AuthSuccessResponse(
-                "ok", session.accessToken(), "Bearer",
-                session.expiresAt(), session.absoluteExpiryAt(),
-                new AuthSuccessResponse.Principal(session.principalNpub(), session.principalPubkey()),
-                session.roles(), session.permissions()
-        ));
+        when(napServer.verifyCompletion(any()))
+                .thenReturn(VerifyCompletionOutcome.failure(NapErrorCode.NAP_COMPLETE_MISSING_AUTH_HEADER));
+        when(napServer.toPublicAuthFailure())
+                .thenReturn(new NapServer.PublicFailureResponse(401, AuthFailureResponse.authenticationFailed()));
 
-        Object body = controller().complete(request, response).getBody();
+        ResponseEntity<?> result = controller().complete(request, response);
 
+        // The body proof never reaches the verifier, so the server sees a completion with no
+        // authorization at all and answers the same uniform 401 as any other failure.
         var captor = forClass(VerifyCompletionInput.class);
         verify(napServer).verifyCompletion(captor.capture());
-        VerifyCompletionInput completionInput = captor.getValue();
-        assertThat(completionInput.authorization()).isEqualTo("Nostr legacy-proof");
-        assertThat(completionInput.method()).isEqualTo("POST");
-        assertThat(completionInput.url()).isEqualTo("https://account.imani.casa/api/v1/auth/complete");
-        assertThat(completionInput.rawBody()).isEqualTo(requestBody.getBytes());
-        assertThat(response.getCookie("merchant_session")).isNotNull();
-        assertThat(body).isNotNull();
+        assertThat(captor.getValue().authorization()).isNull();
+        assertThat(result.getStatusCode().value()).isEqualTo(401);
+        assertThat(response.getCookie("merchant_session")).isNull();
     }
 
     @Test

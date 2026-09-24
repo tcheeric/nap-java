@@ -42,6 +42,17 @@ public class NapAuthController {
     private final NapServer napServer;
     private final SessionStore sessionStore;
     private final NapProperties properties;
+    /**
+     * Retained for constructor compatibility only, and deliberately unused.
+     *
+     * <p>Its one reader was the body-proof fallback removed in #28. The constructors stay as they
+     * are because they are public API and auto-configuration passes the application's mapper;
+     * dropping the parameter would break every hand-wired controller for no gain. Nothing in this
+     * class should acquire a second JSON reader over the raw body: {@code parseAuthCompleteRequest()}
+     * in NapServer owns that parse, and a second one with different semantics is the
+     * parser-differential surface #28 closed.
+     */
+    @SuppressWarnings("unused")
     private final ObjectMapper objectMapper;
     private final AudienceResolver audienceResolver;
     private final RawBodyExtractor rawBodyExtractor;
@@ -134,7 +145,7 @@ public class NapAuthController {
         }
 
         String authUrl = audienceResolver.resolve(request);
-        String authorization = resolveAuthorization(request, rawBody);
+        String authorization = resolveAuthorization(request);
 
         VerifyCompletionOutcome outcome = napServer.verifyCompletion(new VerifyCompletionInput(
                 authorization, "POST", authUrl, rawBody, clientIpResolver.resolve(request)));
@@ -333,22 +344,31 @@ public class NapAuthController {
                 .orElse(null);
     }
 
-    private String resolveAuthorization(HttpServletRequest request, byte[] rawBody) {
-        String header = request.getHeader("Authorization");
-        if (header != null && !header.isBlank()) {
-            return header;
-        }
-
-        try {
-            @SuppressWarnings("unchecked")
-            Map<String, Object> body = objectMapper.readValue(rawBody, Map.class);
-            Object proof = body.get("proof");
-            if (proof instanceof String proofValue && !proofValue.isBlank()) {
-                return proofValue;
-            }
-        } catch (Exception ignored) {
-            // Raw-body validation happens in NapServer; fallback extraction is best effort.
-        }
-        return null;
+    /**
+     * The NIP-98 proof, from {@code Authorization} and nowhere else.
+     *
+     * <p>A fallback used to read the proof from a {@code proof} field in the JSON body when the
+     * header was absent. It is gone, for four reasons that compound.
+     *
+     * <p>It was not in the protocol surface. {@link Nip98Validator} requires
+     * {@code Authorization: Nostr <base64>}, the RFC documents only that, and the TypeScript
+     * implementation has no equivalent, so it was a JVM-only credential location that no
+     * specification, test vector, or interop test described.
+     *
+     * <p>The hash coverage was self-referential. NIP-98's {@code payload} tag commits to
+     * {@code sha256(rawBody)}. A proof carried inside the body is part of what it must hash, so
+     * the construction is satisfiable only by excluding the field before hashing, which nothing
+     * specified and nothing enforced.
+     *
+     * <p>It parsed attacker-controlled bytes a second time. {@code parseAuthCompleteRequest()}
+     * already reads this buffer under a strict shape check; a second reader with different
+     * semantics and a blanket catch is a parser-differential surface, and the swallowed
+     * exception meant a body parsing differently in the two places produced no signal.
+     *
+     * <p>And a credential in a body gets logged by anything that logs request payloads, which is
+     * the reason {@code /auth/refresh} takes its token from a header rather than the body.
+     */
+    private static String resolveAuthorization(HttpServletRequest request) {
+        return request.getHeader("Authorization");
     }
 }
