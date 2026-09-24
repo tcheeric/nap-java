@@ -1,0 +1,21 @@
+# Dependency updates arrive as reviewable PRs rather than silent drift.
+# The Java tree is managed by imani-bom, so most transitive upgrades land through that
+# single coordinate: watching the root pom is what surfaces them at all.
+version: 2
+updates:
+  - package-ecosystem: maven
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    labels:
+      - dependencies
+
+  # The workflows above pin actions by major tag, which still moves underneath us.
+  # Keeping them updated here means CI infrastructure ages visibly.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    labels:
+      - dependencies

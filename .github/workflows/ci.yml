@@ -1,0 +1,127 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master, develop]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and test (Java ${{ matrix.java }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        java: ['21']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: ${{ matrix.java }}
+          distribution: temurin
+          cache: maven
+
+      # TypeScriptClientInteropTest spawns the real @imani/nap-client-http package through
+      # tsx, so a node toolchain must exist before Maven runs.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # Correctness in this repository is defined relative to the TypeScript reference
+      # implementation, and the two tests that assert that (OfficialTestVectorsTest and
+      # TypeScriptClientInteropTest) both call JUnit assumeTrue when the sibling `nap`
+      # checkout is absent. assumeTrue SKIPS rather than fails, so without this clone the
+      # interop suite reports green while asserting nothing, which is precisely the silent
+      # regression this CI exists to catch.
+      #
+      # The clone target is not configurable: TypeScriptClientInteropTest hard-codes
+      # Path.of(user.home, "IdeaProjects", "nap") with no override property, so the path
+      # below has to match it exactly. OfficialTestVectorsTest does accept
+      # -Dnap.test-vectors.dir, but pointing both at one checkout keeps them consistent.
+      - name: Check out the TypeScript reference implementation
+        run: |
+          git clone --depth 1 https://github.com/tcheeric/nap.git "$HOME/IdeaProjects/nap"
+
+      # The interop test looks for node_modules/.bin/tsx inside that checkout. Installing
+      # dependencies is what flips the test from skipped to actually executed.
+      - name: Install TypeScript client dependencies
+        run: npm ci --prefix "$HOME/IdeaProjects/nap"
+
+      # A skipped test is indistinguishable from a passing one in a green check, so assert
+      # the interop preconditions explicitly and fail loudly when they are missing.
+      - name: Assert the interop toolchain is present
+        run: |
+          test -x "$HOME/IdeaProjects/nap/node_modules/.bin/tsx" \
+            || { echo "tsx missing: the interop test would silently skip"; exit 1; }
+          test -f "$HOME/IdeaProjects/nap/packages/nap-core/test-vectors/nip98.json" \
+            || { echo "test vectors missing: vector tests would silently skip"; exit 1; }
+
+      # verify rather than test so the nap-it module runs as part of the reactor.
+      # Note: every class in nap-it is named *Test, so surefire runs them all and the
+      # configured failsafe plugin currently matches nothing. The interop coverage is real
+      # but it arrives through surefire, not failsafe.
+      - name: Build and test
+        run: mvn -B -ntp verify
+
+      # Publish the reports so skip counts stay reviewable rather than hidden behind a check.
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-reports-java-${{ matrix.java }}
+          path: |
+            **/target/surefire-reports/**
+            **/target/failsafe-reports/**
+          if-no-files-found: warn
+
+  dependency-check:
+    name: OWASP Dependency-Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: temurin
+          cache: maven
+
+      # The dependency tree is managed by imani-bom, so transitive CVEs arrive without any
+      # visible version bump in this repository. Jackson matters directly: Nip98Validator
+      # and DefaultNapServer parse attacker-controlled JSON on the unauthenticated path.
+      #
+      # CVSS >= 7 is the opening gate. A scanner developers learn to ignore has negative
+      # value, so tighten only once the baseline is known clean.
+      #
+      # The NVD API key is passed only when the secret is actually set. Passing an empty
+      # -DnvdApiKey= is not equivalent to omitting it: the plugin rejects it outright with
+      # "Invalid API Key, length of 0", verified locally against dependency-check 13.0.0.
+      # Without a key the NVD feed is rate limited to roughly one request per six seconds,
+      # so the first run is slow rather than broken. Set the NVD_API_KEY repository secret
+      # (free from https://nvd.nist.gov/developers/request-an-api-key) to make it fast.
+      - name: Run Dependency-Check
+        env:
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+        run: |
+          if [ -n "$NVD_API_KEY" ]; then
+            mvn -B -ntp org.owasp:dependency-check-maven:check \
+              -DfailBuildOnCVSS=7 -DnvdApiKey="$NVD_API_KEY"
+          else
+            echo "NVD_API_KEY is not set: falling back to the rate limited public NVD feed."
+            mvn -B -ntp org.owasp:dependency-check-maven:check -DfailBuildOnCVSS=7
+          fi
+
+      - name: Upload Dependency-Check report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-check-report
+          path: '**/target/dependency-check-report.html'
+          if-no-files-found: warn
