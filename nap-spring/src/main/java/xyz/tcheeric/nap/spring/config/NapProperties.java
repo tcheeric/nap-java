@@ -45,6 +45,11 @@ public record NapProperties(
         // first request rather than an endpoint quietly serving anyone; @PublicEndpoint is how
         // a genuinely public handler says so.
         Boolean requireAnnotationOnProtectedPaths,
+        // Authorize every principal who proves key control, with no roles or permissions. The
+        // auto-configured AclResolver used to do this silently; it now has to be asked for,
+        // because a no-op authorization layer is indistinguishable from a working one until
+        // someone who should not have access uses it.
+        Boolean allowAllPrincipals,
         CookieProperties cookie
 ) {
 
@@ -86,6 +91,7 @@ public record NapProperties(
         // says so in the source, which is the statement the missing annotation used to make
         // only by omission.
         if (requireAnnotationOnProtectedPaths == null) requireAnnotationOnProtectedPaths = Boolean.TRUE;
+        if (allowAllPrincipals == null) allowAllPrincipals = Boolean.FALSE;
         if (cookie == null) cookie = new CookieProperties("merchant_session", true, true, "Lax", "/", "", 0);
         // Default cookie maxAge to the (effective) absolute session cap so the
         // browser retains the cookie for the full server-side lifetime.

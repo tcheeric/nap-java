@@ -70,6 +70,7 @@ class NapAuthControllerTest {
             List.of(), // trustedProxies — none, so the limiter counts the TCP peer
             List.of("/internal/v1/merchants"),
             false,  // requireAnnotationOnProtectedPaths
+            true,   // allowAllPrincipals — these tests mock NapServer, so no resolver is wired
             cookie
         );
     }

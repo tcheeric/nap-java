@@ -1,6 +1,8 @@
 package xyz.tcheeric.nap.spring.config;
 
 import org.springframework.boot.autoconfigure.AutoConfiguration;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.boot.autoconfigure.jackson.JacksonAutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -38,21 +40,58 @@ import java.time.Clock;
 @EnableConfigurationProperties(NapProperties.class)
 public class NapAutoConfiguration {
 
+    private static final Logger log = LoggerFactory.getLogger(NapAutoConfiguration.class);
+
     @Bean
     @ConditionalOnMissingBean
     public ChallengeStore challengeStore() {
+        log.warn("nap_in_memory_challenge_store: challenges are lost on restart and are not "
+                + "shared between instances. Supply a JdbcChallengeStore bean for any "
+                + "multi-instance or production deployment.");
         return new InMemoryChallengeStore();
     }
 
     @Bean
     @ConditionalOnMissingBean
     public SessionStore sessionStore() {
+        // Warned rather than refused: the in-memory stores are genuinely useful for local
+        // development, so failing here would be the wrong trade. What was wrong was that a
+        // deployment could reach production on them without ever being told, and the
+        // revocation consequence is a security one rather than only an availability one.
+        log.warn("nap_in_memory_session_store: sessions are lost on restart and are not shared "
+                + "between instances, so revokeByPrincipal reaches only this node and a "
+                + "suspended principal keeps working elsewhere until their session expires. "
+                + "Supply a JdbcSessionStore bean for any multi-instance or production "
+                + "deployment.");
         return new InMemorySessionStore();
     }
 
+    /**
+     * There is deliberately no default {@link AclResolver}.
+     *
+     * <p>The previous default was {@link AllowAllAclResolver}, which authorizes every principal
+     * who can prove key control. That is indistinguishable from a working configuration: an
+     * operator wires NAP, logs in with their own key, sees a session, and ships, with nothing
+     * reporting that the authorization layer is a no-op.
+     *
+     * <p>The escape hatch remains, as a written decision rather than an omission. This mirrors
+     * what {@code createAudienceHostAllowlist()} and {@code createMintAllowlist()} already do on
+     * the TypeScript side: refuse at wiring time rather than accept a configuration that permits
+     * everything, because an allowlist that allows everything is the state they exist to make
+     * unrepresentable.
+     */
     @Bean
     @ConditionalOnMissingBean
-    public AclResolver aclResolver() {
+    public AclResolver aclResolver(NapProperties properties) {
+        if (!properties.allowAllPrincipals()) {
+            throw new IllegalStateException(
+                    "NAP requires an AclResolver bean. Supply RegistryAclResolver (or your own), "
+                            + "or set nap.allow-all-principals=true to authorize every principal "
+                            + "who proves key control, which is what the previous default did "
+                            + "silently.");
+        }
+        log.warn("nap_acl_allow_all_enabled: every principal proving key control is authorized, "
+                + "with no roles or permissions. This is nap.allow-all-principals=true.");
         return new AllowAllAclResolver();
     }
 

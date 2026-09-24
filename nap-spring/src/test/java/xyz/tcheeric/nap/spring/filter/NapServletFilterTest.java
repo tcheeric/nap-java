@@ -96,6 +96,7 @@ class NapServletFilterTest {
                 List.of(), // trustedProxies
                 List.of("/internal/v1/merchants"),
                 false,
+                true,   // allowAllPrincipals
                 new NapProperties.CookieProperties("session", true, true, "Lax", "/", "", 43200));
     }
 
