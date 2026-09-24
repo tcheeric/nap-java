@@ -4,6 +4,18 @@ on:
   push:
     branches: [main, master, develop]
   pull_request:
+  # Manual runs, so a scan can be re-checked without inventing a commit. The two SCA
+  # jobs answer to things outside this repository: Dependency-Check needs the
+  # NVD_API_KEY secret and the NVD database behind it, and the OSV job queries a live
+  # advisory API. Both can change their answer with the source untouched, and until
+  # now the only way to ask again was to push something.
+  workflow_dispatch:
+  # Nightly, for Dependency-Check specifically. It is excluded from pull requests
+  # because a cold NVD build is about 80 minutes, so this is where it actually runs,
+  # and where it keeps the cache warm for the next one. 03:17 rather than 03:00 to
+  # avoid the top-of-hour crowd that makes scheduled runs queue.
+  schedule:
+    - cron: '17 3 * * *'
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -16,6 +28,10 @@ jobs:
   build:
     name: Build and test (Java ${{ matrix.java }})
     runs-on: ubuntu-latest
+    # Observed around 1 minute. The cap is for a hang, not for slowness: the interop
+    # tests spawn a node process, and a child that never exits would otherwise sit on
+    # GitHub's 360 minute default.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -111,9 +127,13 @@ jobs:
   osv-scan:
     name: OSV vulnerability scan
     runs-on: ubuntu-latest
-    # The SCA that actually runs. Dependency-Check below needs an NVD API key and skips
-    # without one, so on a fork or before the secret exists it scans nothing while still
-    # reporting a green check. OSV needs no key and no 12 minute database build.
+    # Observed around 20 seconds. The cap covers the live OSV API failing to answer
+    # rather than refusing, which no amount of waiting would improve.
+    timeout-minutes: 15
+    # The SCA that always runs. Dependency-Check below needs the NVD_API_KEY secret and
+    # skips without it, which still covers forks and any clone that does not carry the
+    # secret. OSV needs no key and no 12 minute database build, so it is the one scan
+    # that cannot be silently disabled by a missing credential.
     #
     # It earns its place rather than duplicating: on the first run it found bcprov 1.84
     # carrying a CRITICAL and a HIGH, and jackson-databind 2.21.4 carrying two MODERATEs.
@@ -194,10 +214,24 @@ jobs:
   dependency-check:
     name: OWASP Dependency-Check
     runs-on: ubuntu-latest
-    # Secondary to osv-scan above, which is the gate. This one reports without blocking
-    # because it cannot run at all without the NVD_API_KEY secret, and a check that turns
-    # red on a missing secret rather than a real finding is how a team learns to click past
-    # a scanner.
+    # Not on pull requests. The NVD API returns roughly 5,000 records per minute even
+    # with a key, and the database is 397,360 records, so a cold build is about 80
+    # minutes: measured here, not estimated, from the first run that had a key. Paying
+    # that on a pull request is unreasonable, and the cache does not rescue it, because
+    # the first run to populate the cache still has to do the full download before the
+    # cache step can save anything.
+    #
+    # So it runs on a schedule and on demand, where 80 minutes is acceptable and where
+    # each run also refreshes the cache that makes the next one quick. Pull requests are
+    # covered by osv-scan, which answers the same question in 20 seconds without a key.
+    # A nightly scan is the right cadence anyway: advisories appear against dependencies
+    # that have not changed, so the interesting result arrives without a commit.
+    if: github.event_name != 'pull_request'
+    #
+    # Secondary to osv-scan above, which is the gate. The NVD_API_KEY secret was added on
+    # 2026-09-24, so this job now performs a real scan here rather than skipping, but it
+    # still skips on a fork or any clone without the secret. Reporting rather than
+    # blocking keeps that difference from turning into a red check about a credential.
     #
     # An earlier note here claimed 14 findings in spring-core and spring-security-core.
     # That was not reproducible and was retracted. A later note claimed the tree "currently
@@ -206,8 +240,14 @@ jobs:
     # them, bcprov 1.84, were CRITICAL and HIGH. Both claims came from a local run against
     # a populated database, which is a weaker check than it looks.
     #
-    # Keep it non-blocking until it has run green on a runner with a key a few times.
+    # Given that history, it stays non-blocking until it has run green on a runner with
+    # the key a few times. Promoting it before then would be trusting a third claim of
+    # the same shape as the two that were wrong.
     continue-on-error: true
+    # Sized for the cold build plus headroom, rather than GitHub's 360 minute default.
+    # With continue-on-error, an unbounded wedged scan would quietly burn six hours per
+    # trigger while reporting nothing.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -216,10 +256,14 @@ jobs:
           distribution: temurin
           cache: maven
 
-      # Building the NVD database from scratch took 12 minutes locally. Caching it keeps
-      # this job to the scan itself on subsequent runs. The key rolls per run so the cache
-      # is refreshed, and restore-keys lets each run start from the previous database and
-      # apply only the delta.
+      # Building the NVD database from scratch is about 80 minutes on a runner: 397,360
+      # records at roughly 5,000 per minute, measured on the first run that had an API
+      # key. It took 12 minutes on a warm developer machine, which is the figure this
+      # comment used to quote and which badly understated the cost here.
+      #
+      # So this cache is what makes the job viable rather than merely quicker. The key
+      # rolls per run so each run writes a fresh copy, and restore-keys lets it start
+      # from the previous database and apply only the delta.
       - name: Cache the NVD database
         uses: actions/cache@v4
         with:
