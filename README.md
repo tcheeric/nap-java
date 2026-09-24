@@ -143,6 +143,20 @@ mvn -q test      # unit tests
 mvn -q verify    # + integration tests (Docker required for Testcontainers)
 ```
 
+Prefer `verify` over `install` on a feature branch. An `install` writes over whatever
+is cached at that coordinate, so building a branch whose pom still carries the last
+released version replaces that release in your local repository. Maven checks a
+checksum when it downloads an artifact and never again, so nothing reports it, and
+the damage surfaces later as a consumer that cannot compile against a version it has
+pinned. That has already happened once (tcheeric/nap#41).
+
+If a build starts failing in a way that blames a released artifact:
+
+```bash
+python3 check-m2-integrity.py          # list first-party jars that fail their own checksum
+python3 check-m2-integrity.py --fix    # delete those so Maven refetches them
+```
+
 ## Upgrading
 
 [UPGRADING.md](UPGRADING.md) covers what breaks between releases. Read it before taking
