@@ -57,12 +57,18 @@ jobs:
 
       # A skipped test is indistinguishable from a passing one in a green check, so assert
       # the interop preconditions explicitly and fail loudly when they are missing.
+      #
+      # Every vector file is checked, not just one. OfficialTestVectorsTest loads three
+      # (payload-hash.json, nip98.json, flow.json) and assumeTrue's on each independently,
+      # so a checkout missing only one of them would skip that test and still report green.
       - name: Assert the interop toolchain is present
         run: |
           test -x "$NAP_TS_DIR/node_modules/.bin/tsx" \
             || { echo "tsx missing: the interop test would silently skip"; exit 1; }
-          test -f "$NAP_TS_DIR/packages/nap-core/test-vectors/nip98.json" \
-            || { echo "test vectors missing: vector tests would silently skip"; exit 1; }
+          for vector in payload-hash.json nip98.json flow.json; do
+            test -f "$NAP_TS_DIR/packages/nap-core/test-vectors/$vector" \
+              || { echo "test vector $vector missing: that vector test would silently skip"; exit 1; }
+          done
 
       # verify rather than test so the nap-it module runs as part of the reactor.
       # Note: every class in nap-it is named *Test, so surefire runs them all and the
