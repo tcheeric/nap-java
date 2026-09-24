@@ -75,7 +75,7 @@ public class NapSessionFilter extends OncePerRequestFilter {
     @Override
     protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response,
                                      FilterChain filterChain) throws ServletException, IOException {
-        String path = request.getRequestURI();
+        String path = pathWithinApplication(request);
         boolean isProtected = protectedPrefixes.stream().anyMatch(path::startsWith);
 
         if (!isProtected) {
@@ -89,23 +89,29 @@ public class NapSessionFilter extends OncePerRequestFilter {
             return;
         }
 
-        String sessionId = extractCookie(request);
-        if (sessionId == null) {
-            filterChain.doFilter(request, response);
+        // The cookie carries the access token, not the session id. The two are not
+        // interchangeable: the session id is an identifier that appears in logs and on
+        // challenge rows, while the access token is the credential rotation replaces on
+        // every refresh. Authenticating on the identifier would mean the value a browser
+        // presents is never rotated, and that every log line naming a session is a live
+        // credential.
+        String accessToken = extractCookie(request);
+        if (accessToken == null) {
+            unauthenticated(request, response, filterChain, "no_cookie", null);
             return;
         }
 
-        var session = sessionStore.getBySessionId(sessionId);
+        var session = sessionStore.getByAccessToken(accessToken);
 
         if (session.isEmpty()) {
-            filterChain.doFilter(request, response);
+            unauthenticated(request, response, filterChain, "unknown_token", null);
             return;
         }
 
         SessionRecord record = session.get();
         if (isExpired(record)) {
             sessionStore.revokeBySessionId(record.sessionId(), Instant.now().getEpochSecond());
-            filterChain.doFilter(request, response);
+            unauthenticated(request, response, filterChain, "expired", record.principalPubkey());
             return;
         }
 
@@ -135,6 +141,75 @@ public class NapSessionFilter extends OncePerRequestFilter {
         } finally {
             SecurityContextHolder.clearContext();
         }
+    }
+
+    /**
+     * Continue the chain without an authentication, leaving a record that it happened.
+     *
+     * <p>This filter does not refuse the request: whether an unauthenticated caller may reach a
+     * handler is {@link NapPermissionInterceptor}'s decision, and an adapter cannot know which
+     * endpoints are meant to be public. But the three ways a protected request arrives
+     * unauthenticated used to produce no output at all, so an operator could not tell "nobody is
+     * calling this" from "everybody is, without a session". The TypeScript guards emit
+     * {@code NAP_GUARD_NO_SESSION} per refusal for the same reason.
+     *
+     * <p>Debug rather than warn: an unauthenticated request to a protected path is ordinary
+     * before login. What matters is that it is greppable.
+     */
+    private void unauthenticated(HttpServletRequest request, HttpServletResponse response,
+                                 FilterChain filterChain, String reason, String pubkey)
+            throws ServletException, IOException {
+        if (log.isDebugEnabled()) {
+            log.debug("nap_guard_no_session reason={} path={} pubkey={}",
+                    reason, forLog(pathWithinApplication(request)), pubkey);
+        }
+        filterChain.doFilter(request, response);
+    }
+
+    /**
+     * Strips line breaks from a value before it reaches the log.
+     *
+     * <p>The path is the one field here an attacker chooses. {@code reason} is a literal and
+     * {@code pubkey} comes from the session store, but the URI is whatever was requested, and
+     * a newline in a log line lets a caller append a second line that looks like ours: a
+     * forged {@code nap_guard_no_session} entry naming someone else's pubkey, or a fabricated
+     * success hiding a real refusal. Log analysis is parsed by line, so this is a truthfulness
+     * problem for the audit trail rather than an availability one.
+     *
+     * <p>Not reachable through Tomcat today, which rejects raw CR/LF in the request line and
+     * leaves {@code %0D%0A} percent-encoded through {@code getRequestURI()}. Verified, not
+     * assumed. The escaping belongs here anyway: that safety is the container's decision, not
+     * this filter's, and it does not survive a different servlet container, a forwarded or
+     * rewritten URI, or a future caller passing an already-decoded path.
+     */
+    private static String forLog(String value) {
+        if (value == null) {
+            return null;
+        }
+        return value.replace('\r', '_').replace('\n', '_');
+    }
+
+    /**
+     * The request path with any servlet context path stripped, which is what
+     * {@code nap.protected-path-prefixes} is written against.
+     *
+     * <p>Shared with {@link NapPermissionInterceptor} so the filter and the interceptor cannot
+     * disagree about which requests are protected. They did: this filter matched the raw
+     * {@code getRequestURI()} while the interceptor stripped the context path first, so under a
+     * non-empty context path the filter skipped requests the interceptor believed were covered.
+     * With the interceptor now failing closed on undeclared handlers, that disagreement decides
+     * whether a request is authenticated at all.
+     */
+    static String pathWithinApplication(HttpServletRequest request) {
+        String path = request.getRequestURI();
+        if (path == null) {
+            return "";
+        }
+        String contextPath = request.getContextPath();
+        if (contextPath != null && !contextPath.isEmpty() && path.startsWith(contextPath)) {
+            return path.substring(contextPath.length());
+        }
+        return path;
     }
 
     private String extractCookie(HttpServletRequest request) {

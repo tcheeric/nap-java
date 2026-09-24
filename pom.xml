@@ -6,7 +6,7 @@
 
     <groupId>xyz.tcheeric</groupId>
     <artifactId>nap-java</artifactId>
-    <version>0.8.0</version>
+    <version>0.9.0</version>
     <packaging>pom</packaging>
     <name>NAP Java</name>
     <description>Nostr Authentication Protocol (NAP) v2 Java library — standalone, framework-agnostic implementation with Spring Boot adapter</description>
@@ -28,6 +28,18 @@
 
         <imani-bom.version>0.1.81</imani-bom.version>
 
+        <!-- Security overrides of versions imani-bom resolves transitively. Each is the
+             lowest release that carries the fix, so the override is a patch bump rather
+             than a feature upgrade, and each disappears the moment the BOM catches up.
+             Verified against OSV before and after: the four advisories below drop to zero.
+
+             Both arrive through nostr-java-core, so nothing in this repository names them
+             and no version bump here makes the exposure visible. That is the case the
+             dependency-check job exists for, and it is the case that job was silently not
+             covering while it had no NVD key. -->
+        <bouncycastle.version>1.85</bouncycastle.version>
+        <jackson.version>2.21.5</jackson.version>
+
         <maven-compiler-plugin.version>3.13.0</maven-compiler-plugin.version>
         <maven-surefire-plugin.version>3.5.2</maven-surefire-plugin.version>
         <maven-failsafe-plugin.version>3.2.5</maven-failsafe-plugin.version>
@@ -41,6 +53,29 @@
                 <version>${imani-bom.version}</version>
                 <type>pom</type>
                 <scope>import</scope>
+            </dependency>
+
+            <!-- Declared after the BOM import deliberately: a direct entry in
+                 dependencyManagement wins over an imported one regardless of order, but
+                 reading it here should not require knowing that.
+
+                 bcprov 1.84 -> 1.85 closes GHSA-9pwp-9qqc-pr26 (CRITICAL, name-constraints
+                 bypass via a trailing dot in rfc822Name and URI) and GHSA-qp49-qgx5-5m26
+                 (HIGH, a lazy ASN.1 sequence resetting the nesting-depth guard). This is the
+                 provider behind Schnorr verification on the unauthenticated NIP-98 path.
+
+                 jackson-databind 2.21.4 -> 2.21.5 closes GHSA-5gvw-p9qm-jgwh and
+                 GHSA-mhm7-754m-9p8w, both @JsonView bypasses on deserialization. Jackson
+                 parses attacker-controlled JSON in Nip98Validator and DefaultNapServer. -->
+            <dependency>
+                <groupId>org.bouncycastle</groupId>
+                <artifactId>bcprov-jdk18on</artifactId>
+                <version>${bouncycastle.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.fasterxml.jackson.core</groupId>
+                <artifactId>jackson-databind</artifactId>
+                <version>${jackson.version}</version>
             </dependency>
 
             <!-- Internal modules -->

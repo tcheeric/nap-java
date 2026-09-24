@@ -8,21 +8,70 @@ import xyz.tcheeric.nap.core.RecordChallengeFailureResult;
 import xyz.tcheeric.nap.core.RedeemParams;
 import xyz.tcheeric.nap.core.RedeemResult;
 
+import java.time.Clock;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * In-memory ChallengeStore for testing and single-instance deployments.
+ *
+ * <p>Bounded. Records are dropped once they can no longer affect a decision, because the map is
+ * filled by {@code /auth/init}, which is unauthenticated: without eviction the footprint grows
+ * with login volume at a rate the caller sets. The outstanding-challenge caps do not help, since
+ * they count only records still in {@code ISSUED} and so bound concurrency rather than memory.
  */
 public final class InMemoryChallengeStore implements ChallengeStore {
 
     private final ConcurrentHashMap<String, ChallengeRecord> store = new ConcurrentHashMap<>();
+    private final AtomicLong lastSweptAt = new AtomicLong(Long.MIN_VALUE);
+    private final Clock clock;
+
+    public InMemoryChallengeStore() {
+        this(Clock.systemUTC());
+    }
+
+    /** @param clock injectable so eviction is testable without sleeping. */
+    public InMemoryChallengeStore(Clock clock) {
+        this.clock = clock;
+    }
 
     @Override
     public void create(ChallengeRecord record) {
+        // Swept here rather than on a timer: the store owns no thread and cannot outlive its
+        // holder, which is the same shape BoundedEventReplayGuard uses. create() is also the
+        // method an attacker drives, so the work lands where the growth comes from.
+        sweep(clock.instant().getEpochSecond());
         store.put(record.challengeId(), record);
+    }
+
+    /**
+     * Drop records that can no longer affect a decision.
+     *
+     * <p>The bound is {@code resultCacheUntil} when one is set, and {@code expiresAt} otherwise.
+     * That distinction is load-bearing: a redeemed challenge inside its result-cache window is
+     * what makes a client retry idempotent (RFC §13.3), so evicting on expiry alone would turn a
+     * duplicate submission into a fresh login attempt against a challenge that no longer exists.
+     *
+     * <p>Rate-limited to once per clock tick. Without that a burst makes every request walk the
+     * whole map, which is the load profile eviction exists to prevent.
+     */
+    private void sweep(long now) {
+        long last = lastSweptAt.get();
+        if (now <= last || !lastSweptAt.compareAndSet(last, now)) {
+            return;
+        }
+        store.values().removeIf(record -> {
+            Long cacheUntil = record.resultCacheUntil();
+            return (cacheUntil != null ? cacheUntil : record.expiresAt()) < now;
+        });
+    }
+
+    /** Records currently retained. For tests and diagnostics. */
+    public int size() {
+        return store.size();
     }
 
     @Override

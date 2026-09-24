@@ -51,10 +51,30 @@ class TypeScriptClientInteropTest {
         }
     }
 
+    /**
+     * Where the TypeScript reference implementation is checked out.
+     *
+     * <p>{@code -Dnap.typescript.dir} first, then the historical
+     * {@code ~/IdeaProjects/nap} default so an existing developer checkout keeps working.
+     *
+     * <p>The property matters because of what happens when this path is wrong: the caller
+     * {@code assumeTrue}s on the toolchain, and an assumption <em>skips</em> rather than fails.
+     * A home-relative default on a CI runner therefore produces a green build in which the one
+     * test asserting cross-implementation agreement asserted nothing at all. {@code OfficialTestVectorsTest}
+     * already takes {@code -Dnap.test-vectors.dir} for the same reason; this brings the two into line.
+     */
+    private static Path typescriptCheckoutRoot() {
+        String override = System.getProperty("nap.typescript.dir");
+        if (override != null && !override.isBlank()) {
+            return Path.of(override.trim());
+        }
+        return Path.of(System.getProperty("user.home"), "IdeaProjects", "nap");
+    }
+
     // Authenticates against the Java server by spawning the real TypeScript client package through tsx
     @Test
     void typescriptClientAuthenticatesAgainstJavaServer() throws Exception {
-        Path napRoot = Path.of(System.getProperty("user.home"), "IdeaProjects", "nap");
+        Path napRoot = typescriptCheckoutRoot();
         Path tsxBinary = napRoot.resolve("node_modules/.bin/tsx");
         assumeTrue(Files.exists(tsxBinary), "tsx toolchain not available — skipping interop test");
 

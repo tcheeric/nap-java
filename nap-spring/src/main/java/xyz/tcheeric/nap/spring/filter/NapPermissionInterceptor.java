@@ -148,14 +148,9 @@ public class NapPermissionInterceptor implements HandlerInterceptor {
                 || AnnotatedElementUtils.findMergedAnnotation(handler.getBeanType(), PublicEndpoint.class) != null) {
             return false;
         }
-        String path = request.getRequestURI();
-        if (path == null) {
-            return false;
-        }
-        String contextPath = request.getContextPath();
-        if (contextPath != null && !contextPath.isEmpty() && path.startsWith(contextPath)) {
-            path = path.substring(contextPath.length());
-        }
+        // One path helper for both, so the filter and this interceptor cannot disagree about
+        // which requests fall under a protected prefix.
+        String path = NapSessionFilter.pathWithinApplication(request);
         for (String prefix : protectedPathPrefixes) {
             if (prefix != null && !prefix.isBlank() && path.startsWith(prefix)) {
                 return true;

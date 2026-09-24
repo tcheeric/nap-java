@@ -4,7 +4,7 @@ Java implementation of the **Nostr Authentication Protocol (NAP) v2** — challe
 login with a NIP-98 signed event, server-side sessions, rotating refresh tokens, and
 role/permission ACLs. Framework-agnostic core, optional Spring Boot adapter.
 
-Requires Java 21. Current version: `0.6.2`.
+Requires Java 21. Current version: `0.9.0`.
 
 Versions are managed by `imani-bom`; consumers that import it should omit the
 version entirely. 0.6.0 added the authorization layer (`AclResolver`,
@@ -44,7 +44,7 @@ returns `429` with `Retry-After`.
 <dependency>
   <groupId>xyz.tcheeric</groupId>
   <artifactId>nap-spring</artifactId>
-  <version>0.6.2</version>
+  <version>0.9.0</version>
 </dependency>
 ```
 
@@ -57,14 +57,32 @@ nap:
   refresh-ttl-seconds: 0             # 0 = refresh disabled
   protected-path-prefixes: [/api/v1/merchant]
   trusted-proxies: []                # see "Rate limiting behind a proxy" below
-  require-annotation-on-protected-paths: false
   cookie:
     name: merchant_session
 ```
 
-Auto-configuration supplies `NapServer`, in-memory stores, an `AllowAllAclResolver`, the
-controller, and the permission interceptor — each `@ConditionalOnMissingBean`, so supplying
-your own `SessionStore` (e.g. `JdbcSessionStore`) replaces it.
+**You must supply an `AclResolver` bean.** There is no default. The auto-configuration used to
+fall back to `AllowAllAclResolver`, which authorizes every principal who can prove key control,
+and nothing reported it: you wire NAP, log in with your own key, see a session, and ship with the
+authorization layer a no-op. Supply `RegistryAclResolver` (or your own), or set
+`nap.allow-all-principals: true` to ask for the old behaviour deliberately.
+
+```java
+@Bean
+AclResolver aclResolver(AclStore aclStore) {
+    return RegistryAclResolver.create(myPermissionRegistry, aclStore, /* autoProvision */ false);
+}
+```
+
+Auto-configuration supplies `NapServer`, in-memory stores, the controller, and the permission
+interceptor — each `@ConditionalOnMissingBean`, so supplying your own `SessionStore` (e.g.
+`JdbcSessionStore`) replaces it.
+
+**The in-memory stores are for development.** They are the default because they need no
+configuration, and they log a warning at startup saying so. Sessions are lost on restart and are
+not shared between instances, which makes revocation per-node: `revokeByPrincipal()` on a
+suspension reaches only the instance that served the request, and the principal keeps working
+everywhere else until their session expires. Use `JdbcSessionStore` for anything multi-instance.
 
 **The two filters are not auto-registered** — a second registration would consume the request
 body twice. Register them yourself and pass the settings; there are no defaulting constructors:
@@ -80,19 +98,18 @@ Guard endpoints with `@RequiresPermission` (preferred), `@RequiresRole`, `@Requi
 `@RequiresSession` when the endpoint is for signed-in users generally and no permission
 distinguishes them.
 
-**A handler that declares none of these is not guarded.** `NapSessionFilter` populates the
-`SecurityContext` on `nap.protected-path-prefixes` but lets unauthenticated requests through, and
-the interceptor only rejects handlers that declare a requirement — so a protected prefix means
-"authenticate here if you can", not "login required". `@RequiresSession` is how a handler says
-the latter.
+**A handler that declares none of these is refused inside a protected prefix.**
+`NapSessionFilter` populates the `SecurityContext` on `nap.protected-path-prefixes` but lets
+unauthenticated requests through, and the interceptor is what enforces. Since a handler under a
+protected prefix that declares nothing would otherwise be served to anyone,
+`nap.require-annotation-on-protected-paths` **defaults to `true`**: an undeclared handler there is
+refused with `500` (a wiring bug, not a caller error, so no credential would help). Genuinely
+public endpoints stay expressible with `@PublicEndpoint("why")`, which states in the source what
+omission used to state only by accident.
 
-That default is defensible — the adapter cannot know which endpoints are meant to be public —
-but it is also what forgetting looks like, so a handler added to a protected controller without
-an annotation is exposed with nothing in the diff to show for it. Set
-`nap.require-annotation-on-protected-paths: true` to make the declaration mandatory inside
-`nap.protected-path-prefixes`: an undeclared handler there is refused with `500` (a wiring bug,
-not a caller error — no credential would help). Genuinely public endpoints stay expressible with
-`@PublicEndpoint("why")`, which states in the source what omission used to state only by accident.
+Set it to `false` to restore the previous behaviour, where an unannotated handler is public. That
+is the configuration in which forgetting an annotation exposes an endpoint with nothing in the
+diff to show for it, so prefer `@PublicEndpoint`.
 
 ## Rate limiting behind a proxy
 
@@ -125,6 +142,13 @@ proxies wrote, which is the first one a hop you trust actually observed. Anythin
 mvn -q test      # unit tests
 mvn -q verify    # + integration tests (Docker required for Testcontainers)
 ```
+
+## Upgrading
+
+[UPGRADING.md](UPGRADING.md) covers what breaks between releases. Read it before taking
+0.9.0: startup now fails without an `AclResolver`, every live session ends once when the
+cookie switches to the access token, and an unannotated handler under a protected prefix
+returns `500` instead of being served.
 
 ## Specification
 

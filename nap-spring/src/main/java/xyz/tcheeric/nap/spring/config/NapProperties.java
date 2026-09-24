@@ -45,6 +45,11 @@ public record NapProperties(
         // first request rather than an endpoint quietly serving anyone; @PublicEndpoint is how
         // a genuinely public handler says so.
         Boolean requireAnnotationOnProtectedPaths,
+        // Authorize every principal who proves key control, with no roles or permissions. The
+        // auto-configured AclResolver used to do this silently; it now has to be asked for,
+        // because a no-op authorization layer is indistinguishable from a working one until
+        // someone who should not have access uses it.
+        Boolean allowAllPrincipals,
         CookieProperties cookie
 ) {
 
@@ -78,8 +83,16 @@ public record NapProperties(
         if (stepUpTtlSeconds <= 0) stepUpTtlSeconds = 600;
         if (aclRefreshIntervalSeconds <= 0) aclRefreshIntervalSeconds = 300;
         if (protectedPathPrefixes == null) protectedPathPrefixes = List.of();
-        if (requireAnnotationOnProtectedPaths == null) requireAnnotationOnProtectedPaths = Boolean.FALSE;
-        if (cookie == null) cookie = new CookieProperties("merchant_session", true, true, "Lax", "/", "", 0);
+        // Defaults to true, and only bites when protected-path-prefixes is non-empty: a
+        // deployment that has named its protected paths has stated an intent, and a handler
+        // under one of them that declares no NAP annotation is served to anyone. That failure
+        // is silent -- nothing at startup, nothing in the log, and a diff showing a new
+        // endpoint with no guard removed. @PublicEndpoint is how a genuinely public handler
+        // says so in the source, which is the statement the missing annotation used to make
+        // only by omission.
+        if (requireAnnotationOnProtectedPaths == null) requireAnnotationOnProtectedPaths = Boolean.TRUE;
+        if (allowAllPrincipals == null) allowAllPrincipals = Boolean.FALSE;
+        if (cookie == null) cookie = new CookieProperties(null, null, null, null, null, null, 0);
         // Default cookie maxAge to the (effective) absolute session cap so the
         // browser retains the cookie for the full server-side lifetime.
         if (cookie.maxAgeSeconds() <= 0) {
@@ -92,8 +105,8 @@ public record NapProperties(
 
     public record CookieProperties(
             String name,
-            boolean httpOnly,
-            boolean secure,
+            Boolean httpOnly,
+            Boolean secure,
             String sameSite,
             String path,
             String domain,
@@ -101,6 +114,14 @@ public record NapProperties(
     ) {
         public CookieProperties {
             if (name == null || name.isBlank()) name = "merchant_session";
+            // Boxed so that "not configured" is distinguishable from "configured false".
+            // As primitives these defaulted to false the moment any sibling property was
+            // bound, so a deployment setting only `nap.cookie.name` silently got a session
+            // cookie with neither HttpOnly nor Secure: readable by script and sent in clear
+            // over http. Only the all-absent case reached the true defaults, which is the
+            // case a test constructing NapProperties by hand is most likely to exercise.
+            if (httpOnly == null) httpOnly = Boolean.TRUE;
+            if (secure == null) secure = Boolean.TRUE;
             if (sameSite == null) sameSite = "Lax";
             if (path == null) path = "/";
             // maxAgeSeconds ≤ 0 is treated as "unset" by the enclosing NapProperties

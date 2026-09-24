@@ -1,0 +1,258 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master, develop]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and test (Java ${{ matrix.java }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        java: ['21']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: ${{ matrix.java }}
+          distribution: temurin
+          cache: maven
+
+      # TypeScriptClientInteropTest spawns the real @imani/nap-client-http package through
+      # tsx, so a node toolchain must exist before Maven runs.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # Correctness in this repository is defined relative to the TypeScript reference
+      # implementation, and the two tests that assert that (OfficialTestVectorsTest and
+      # TypeScriptClientInteropTest) both call JUnit assumeTrue when the sibling `nap`
+      # checkout is absent. assumeTrue SKIPS rather than fails, so without this clone the
+      # interop suite reports green while asserting nothing, which is precisely the silent
+      # regression this CI exists to catch.
+      #
+      # Cloned into the workspace rather than $HOME: both tests now take an explicit
+      # directory property, so the location is chosen here instead of being dictated by a
+      # hard-coded home-relative path in test source.
+      - name: Check out the TypeScript reference implementation
+        run: |
+          git clone --depth 1 https://github.com/tcheeric/nap.git "$GITHUB_WORKSPACE/../nap-ts"
+          echo "NAP_TS_DIR=$(cd "$GITHUB_WORKSPACE/../nap-ts" && pwd)" >> "$GITHUB_ENV"
+
+      # The interop test looks for node_modules/.bin/tsx inside that checkout. Installing
+      # dependencies is what flips the test from skipped to actually executed.
+      - name: Install TypeScript client dependencies
+        run: npm ci --prefix "$NAP_TS_DIR"
+
+      # A skipped test is indistinguishable from a passing one in a green check, so assert
+      # the interop preconditions explicitly and fail loudly when they are missing.
+      #
+      # Every vector file is checked, not just one. OfficialTestVectorsTest loads three
+      # (payload-hash.json, nip98.json, flow.json) and assumeTrue's on each independently,
+      # so a checkout missing only one of them would skip that test and still report green.
+      - name: Assert the interop toolchain is present
+        run: |
+          test -x "$NAP_TS_DIR/node_modules/.bin/tsx" \
+            || { echo "tsx missing: the interop test would silently skip"; exit 1; }
+          for vector in payload-hash.json nip98.json flow.json; do
+            test -f "$NAP_TS_DIR/packages/nap-core/test-vectors/$vector" \
+              || { echo "test vector $vector missing: that vector test would silently skip"; exit 1; }
+          done
+
+      # verify rather than test so the nap-it module runs as part of the reactor.
+      # Note: every class in nap-it is named *Test, so surefire runs them all and the
+      # configured failsafe plugin currently matches nothing. The interop coverage is real
+      # but it arrives through surefire, not failsafe.
+      #
+      # Both interop directories are passed explicitly. Without them the tests fall back to
+      # a home-relative default that does not exist on a runner, and assumeTrue would skip
+      # them silently rather than fail.
+      - name: Build and test
+        run: |
+          mvn -B -ntp verify \
+            -Dnap.typescript.dir="$NAP_TS_DIR" \
+            -Dnap.test-vectors.dir="$NAP_TS_DIR/packages/nap-core/test-vectors"
+
+      # Publish the reports so skip counts stay reviewable rather than hidden behind a check.
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-reports-java-${{ matrix.java }}
+          path: |
+            **/target/surefire-reports/**
+            **/target/failsafe-reports/**
+          if-no-files-found: warn
+
+  osv-scan:
+    name: OSV vulnerability scan
+    runs-on: ubuntu-latest
+    # The SCA that actually runs. Dependency-Check below needs an NVD API key and skips
+    # without one, so on a fork or before the secret exists it scans nothing while still
+    # reporting a green check. OSV needs no key and no 12 minute database build.
+    #
+    # It earns its place rather than duplicating: on the first run it found bcprov 1.84
+    # carrying a CRITICAL and a HIGH, and jackson-databind 2.21.4 carrying two MODERATEs.
+    # Both arrive transitively through nostr-java-core, so nothing in this repository
+    # names them, which is exactly the blind spot an SCA job exists to cover.
+    #
+    # Blocking, unlike Dependency-Check. A scan that cannot run without a secret must not
+    # gate a merge; this one can always run, so it can.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: temurin
+          cache: maven
+
+      # Scanning the resolved tree, not the poms. osv-scanner reads pom.xml directly, but
+      # this is a multi-module build whose siblings are not in any registry, so resolution
+      # fails per module and it reports "0 packages affected by 0 known vulnerabilities":
+      # a green result that scanned nothing. Verified locally before choosing this route.
+      # `mvn dependency:tree` resolves against the real BOM, including the overrides in the
+      # parent pom, so what gets scanned is what actually ships.
+      #
+      # -DoutputFile is resolved per module, not once for the reactor, so this writes a
+      # deptree.txt into each module directory and leaves the root one holding only the
+      # aggregator's own line. The query step globs for all of them rather than reading
+      # the root file, which is what it did on the first run: the scan failed closed with
+      # "would pass vacuously" instead of reporting a green zero.
+      - name: Resolve the dependency tree
+        run: mvn -q -B -ntp dependency:tree -DoutputFile=deptree.txt -DappendOutput=true
+
+      - name: Query OSV
+        run: |
+          python3 - <<'PY'
+          import json, pathlib, re, sys, urllib.request
+
+          # Third-party runtime and compile dependencies only. The xyz.tcheeric modules are
+          # this build's own artifacts and exist in no advisory database.
+          packages = {}
+          trees = sorted(pathlib.Path('.').glob('**/deptree.txt'))
+          print(f'Reading {len(trees)} dependency tree file(s): '
+                + ', '.join(str(t) for t in trees))
+          for tree in trees:
+              for line in tree.read_text().splitlines():
+                  match = re.search(r'([\w.\-]+):([\w.\-]+):jar:([\w.\-]+):(compile|runtime)', line)
+                  if match:
+                      group, artifact, version, _ = match.groups()
+                      if not group.startswith('xyz.tcheeric'):
+                          packages[f'{group}:{artifact}'] = version
+
+          if not packages:
+              sys.exit('No packages parsed from any deptree.txt: the scan would pass vacuously.')
+
+          ordered = sorted(packages.items())
+          payload = json.dumps({'queries': [
+              {'package': {'name': name, 'ecosystem': 'Maven'}, 'version': version}
+              for name, version in ordered
+          ]}).encode()
+
+          request = urllib.request.Request('https://api.osv.dev/v1/querybatch', data=payload)
+          results = json.load(urllib.request.urlopen(request, timeout=120))['results']
+
+          findings = []
+          for (name, version), result in zip(ordered, results):
+              ids = [v['id'] for v in (result.get('vulns') or [])]
+              if ids:
+                  findings.append(f'{name}@{version}: {", ".join(ids)}')
+
+          print(f'Scanned {len(ordered)} third-party packages.')
+          for finding in findings:
+              print(f'::error title=Known vulnerability::{finding}')
+
+          if findings:
+              sys.exit(f'{len(findings)} package(s) with known advisories.')
+          print('No known advisories.')
+          PY
+
+  dependency-check:
+    name: OWASP Dependency-Check
+    runs-on: ubuntu-latest
+    # Secondary to osv-scan above, which is the gate. This one reports without blocking
+    # because it cannot run at all without the NVD_API_KEY secret, and a check that turns
+    # red on a missing secret rather than a real finding is how a team learns to click past
+    # a scanner.
+    #
+    # An earlier note here claimed 14 findings in spring-core and spring-security-core.
+    # That was not reproducible and was retracted. A later note claimed the tree "currently
+    # scans clean", which was also wrong, just less visibly: this job had never run on a
+    # runner, and OSV found four advisories the moment anything actually scanned. Two of
+    # them, bcprov 1.84, were CRITICAL and HIGH. Both claims came from a local run against
+    # a populated database, which is a weaker check than it looks.
+    #
+    # Keep it non-blocking until it has run green on a runner with a key a few times.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: temurin
+          cache: maven
+
+      # Building the NVD database from scratch took 12 minutes locally. Caching it keeps
+      # this job to the scan itself on subsequent runs. The key rolls per run so the cache
+      # is refreshed, and restore-keys lets each run start from the previous database and
+      # apply only the delta.
+      - name: Cache the NVD database
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository/org/owasp/dependency-check-data
+          key: nvd-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            nvd-${{ runner.os }}-
+
+      # The dependency tree is managed by imani-bom, so transitive CVEs arrive without any
+      # visible version bump in this repository. Jackson matters directly: Nip98Validator
+      # and DefaultNapServer parse attacker-controlled JSON on the unauthenticated path.
+      #
+      # CVSS >= 7 is the opening gate. A scanner developers learn to ignore has negative
+      # value, so tighten only once the baseline is known clean.
+      #
+      # An NVD API key is required, not merely an optimisation. An earlier version of this
+      # comment claimed a missing key meant "slow rather than broken"; the first run on a
+      # runner disproved that, failing in 52s with "Invalid API Key, length of 0 too short".
+      # Reproduced locally against an empty data directory: the keyless run fails the same
+      # way whether NVD_API_KEY is empty or entirely unset, so it is the absent key rather
+      # than the empty string that breaks it. The message is misleading, since it describes
+      # key masking rather than the rejected request underneath. The legacy 1.1 JSON feeds
+      # are not a way around it either: nvd.nist.gov now answers those with 403.
+      #
+      # So the job skips with an explanation instead of failing red on every PR until the
+      # secret exists. A permanently red check that everyone knows to ignore trains people
+      # to ignore the scanner, which is worse than not running it. Get a free key at
+      # https://nvd.nist.gov/developers/request-an-api-key and add it as the NVD_API_KEY
+      # repository secret, and this becomes a real scan on the next run.
+      - name: Run Dependency-Check
+        env:
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+        run: |
+          if [ -n "$NVD_API_KEY" ]; then
+            mvn -B -ntp org.owasp:dependency-check-maven:check \
+              -DfailBuildOnCVSS=7 -DnvdApiKey="$NVD_API_KEY"
+          else
+            echo "::warning title=Dependency-Check skipped::NVD_API_KEY secret is not set, so the NVD database cannot be built and no scan ran. Add the secret (free key: https://nvd.nist.gov/developers/request-an-api-key) to enable this job."
+            echo "Skipping the scan: without an API key the NVD update fails outright rather"
+            echo "than running slowly, so there is nothing to scan against."
+          fi
+
+      - name: Upload Dependency-Check report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-check-report
+          path: '**/target/dependency-check-report.html'
+          if-no-files-found: warn
