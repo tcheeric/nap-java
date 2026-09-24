@@ -515,6 +515,40 @@ class NapAuthControllerTest {
         assertThat(cookie.getValue()).isNotEqualTo("access-before");
     }
 
+    /**
+     * Logout stays idempotent after the switch to access-token lookup.
+     *
+     * <p>getByAccessToken filters revoked sessions, so the second call finds nothing to
+     * revoke. It must still clear the cookie and answer 204: a client clearing local state
+     * should never have to distinguish "logged out" from "was already logged out", and a
+     * double-submit or a retry is ordinary.
+     */
+    @Test
+    void logout_isIdempotent() {
+        long now = Instant.now().getEpochSecond();
+        SessionRecord live = SessionRecord.create(
+                "sid-twice", "chal-t", "access-twice",
+                "npub-t", "a".repeat(64),
+                List.of(), List.of(),
+                now - 60, now - 60, now + 900, now + 43200
+        );
+        sessionStore.createForChallenge(live);
+
+        for (int attempt = 1; attempt <= 2; attempt++) {
+            MockHttpServletRequest request = new MockHttpServletRequest("POST", "/api/v1/auth/logout");
+            request.setCookies(new Cookie("merchant_session", "access-twice"));
+            MockHttpServletResponse response = new MockHttpServletResponse();
+
+            ResponseEntity<Void> result = controller().logout(request, response);
+
+            assertThat(result.getStatusCode().value()).as("attempt " + attempt).isEqualTo(204);
+            Cookie cookie = response.getCookie("merchant_session");
+            assertThat(cookie).as("cookie cleared on attempt " + attempt).isNotNull();
+            assertThat(cookie.getMaxAge()).isEqualTo(0);
+        }
+        assertThat(sessionStore.getBySessionId("sid-twice")).isEmpty();
+    }
+
     /** Logout resolves the cookie to a session before revoking, so a 204 really did revoke. */
     @Test
     void logout_revokesTheSessionTheAccessTokenNames() {
