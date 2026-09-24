@@ -5,11 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.9.0] - 2026-09-24
 
-Security fixes from an application-security audit. **Three of these change behaviour**, and
-one of them ends every live session on deploy. `NapProperties` is a record and gained a
-component, so its canonical constructor arity changed again.
+Minor rather than patch: three of these change behaviour, and one ends every live session
+on deploy. `NapProperties` is a record and gained a component, so its canonical constructor
+arity changed again.
+
+Read the three **Breaking** notes below before upgrading. In order of what they cost: the
+cookie switch logs every signed-in user out once, the ACL default fails startup until an
+`AclResolver` is supplied or the opt-in property is set, and the protected-path default
+turns an unannotated handler under a protected prefix into a `500`.
 
 ### Security
 
