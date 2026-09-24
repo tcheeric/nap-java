@@ -38,7 +38,7 @@
              dependency-check job exists for, and it is the case that job was silently not
              covering while it had no NVD key. -->
         <bouncycastle.version>1.85</bouncycastle.version>
-        <jackson.version>2.21.5</jackson.version>
+        <jackson.version>2.22.2</jackson.version>
 
         <maven-compiler-plugin.version>3.13.0</maven-compiler-plugin.version>
         <maven-surefire-plugin.version>3.5.2</maven-surefire-plugin.version>
