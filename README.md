@@ -143,6 +143,13 @@ mvn -q test      # unit tests
 mvn -q verify    # + integration tests (Docker required for Testcontainers)
 ```
 
+## Upgrading
+
+[UPGRADING.md](UPGRADING.md) covers what breaks between releases. Read it before taking
+0.9.0: startup now fails without an `AclResolver`, every live session ends once when the
+cookie switches to the access token, and an unannotated handler under a protected prefix
+returns `500` instead of being served.
+
 ## Specification
 
 The protocol spec lives in the sibling `nap` repo: `docs/NAP-v2-RFC.md`. That repo also holds
