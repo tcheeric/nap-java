@@ -123,26 +123,36 @@ jobs:
       # a green result that scanned nothing. Verified locally before choosing this route.
       # `mvn dependency:tree` resolves against the real BOM, including the overrides in the
       # parent pom, so what gets scanned is what actually ships.
+      #
+      # -DoutputFile is resolved per module, not once for the reactor, so this writes a
+      # deptree.txt into each module directory and leaves the root one holding only the
+      # aggregator's own line. The query step globs for all of them rather than reading
+      # the root file, which is what it did on the first run: the scan failed closed with
+      # "would pass vacuously" instead of reporting a green zero.
       - name: Resolve the dependency tree
         run: mvn -q -B -ntp dependency:tree -DoutputFile=deptree.txt -DappendOutput=true
 
       - name: Query OSV
         run: |
           python3 - <<'PY'
-          import json, re, sys, urllib.request
+          import json, pathlib, re, sys, urllib.request
 
           # Third-party runtime and compile dependencies only. The xyz.tcheeric modules are
           # this build's own artifacts and exist in no advisory database.
           packages = {}
-          for line in open('deptree.txt'):
-              match = re.search(r'([\w.\-]+):([\w.\-]+):jar:([\w.\-]+):(compile|runtime)', line)
-              if match:
-                  group, artifact, version, _ = match.groups()
-                  if not group.startswith('xyz.tcheeric'):
-                      packages[f'{group}:{artifact}'] = version
+          trees = sorted(pathlib.Path('.').glob('**/deptree.txt'))
+          print(f'Reading {len(trees)} dependency tree file(s): '
+                + ', '.join(str(t) for t in trees))
+          for tree in trees:
+              for line in tree.read_text().splitlines():
+                  match = re.search(r'([\w.\-]+):([\w.\-]+):jar:([\w.\-]+):(compile|runtime)', line)
+                  if match:
+                      group, artifact, version, _ = match.groups()
+                      if not group.startswith('xyz.tcheeric'):
+                          packages[f'{group}:{artifact}'] = version
 
           if not packages:
-              sys.exit('No packages parsed from deptree.txt: the scan would pass vacuously.')
+              sys.exit('No packages parsed from any deptree.txt: the scan would pass vacuously.')
 
           ordered = sorted(packages.items())
           payload = json.dumps({'queries': [

@@ -5,3 +5,8 @@ target/
 .idea/
 *.iml
 /.claude/
+
+# Written per module by the OSV scan's dependency:tree step, including into the
+# working tree rather than target/, so it would otherwise show up as untracked
+# noise after anyone reproduces that job locally.
+deptree.txt
