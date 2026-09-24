@@ -4,11 +4,18 @@ import xyz.tcheeric.nap.core.RotateRefreshTokenParams;
 import xyz.tcheeric.nap.core.SessionRecord;
 import xyz.tcheeric.nap.core.SessionStore;
 
+import java.time.Clock;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * In-memory SessionStore for testing and single-instance deployments.
+ *
+ * <p>Bounded. A session that has passed its absolute cap, and whose refresh window has closed
+ * too, can no longer affect a decision, so it is dropped rather than retained with a
+ * {@code revokedAt} stamp. Without that the four indexes below only ever grew, at a rate driven
+ * by login volume.
  */
 public final class InMemorySessionStore implements SessionStore {
 
@@ -17,9 +24,67 @@ public final class InMemorySessionStore implements SessionStore {
     private final ConcurrentHashMap<String, SessionRecord> byChallengeId = new ConcurrentHashMap<>();
     /** Holds both the current and the previous refresh token — see {@link #getByRefreshToken}. */
     private final ConcurrentHashMap<String, SessionRecord> byRefreshToken = new ConcurrentHashMap<>();
+    private final AtomicLong lastSweptAt = new AtomicLong(Long.MIN_VALUE);
+    private final Clock clock;
+
+    public InMemorySessionStore() {
+        this(Clock.systemUTC());
+    }
+
+    /** @param clock injectable so eviction is testable without sleeping. */
+    public InMemorySessionStore(Clock clock) {
+        this.clock = clock;
+    }
+
+    /**
+     * Drop sessions that can no longer authenticate or be replayed.
+     *
+     * <p>The bound is the absolute cap, extended to {@code refreshExpiresAt} when it is later.
+     * That extension is deliberate: {@link #getByRefreshToken} keeps answering for a revoked
+     * session precisely so a replay stays visible in the audit log, and evicting on the access
+     * window alone would make a stolen refresh token presented just after expiry look like an
+     * unknown token rather than a reuse.
+     *
+     * <p>Every index is swept together, so a record cannot survive in one map after being
+     * dropped from another. Rate-limited to once per clock tick, matching the challenge store
+     * and {@code InMemoryRateLimiter}.
+     */
+    private void sweep(long now) {
+        long last = lastSweptAt.get();
+        if (now <= last || !lastSweptAt.compareAndSet(last, now)) {
+            return;
+        }
+        bySessionId.values().removeIf(session -> {
+            if (!isDead(session, now)) {
+                return false;
+            }
+            byAccessToken.remove(session.accessToken());
+            byChallengeId.remove(session.challengeId());
+            if (session.refreshToken() != null) {
+                byRefreshToken.remove(session.refreshToken());
+            }
+            if (session.previousRefreshToken() != null) {
+                byRefreshToken.remove(session.previousRefreshToken());
+            }
+            return true;
+        });
+    }
+
+    private static boolean isDead(SessionRecord session, long now) {
+        long deadline = session.refreshExpiresAt() != null
+                ? Math.max(session.absoluteExpiryAt(), session.refreshExpiresAt())
+                : session.absoluteExpiryAt();
+        return deadline < now;
+    }
+
+    /** Sessions currently retained. For tests and diagnostics. */
+    public int size() {
+        return bySessionId.size();
+    }
 
     @Override
     public SessionRecord createForChallenge(SessionRecord record) {
+        sweep(clock.instant().getEpochSecond());
         var existing = byChallengeId.putIfAbsent(record.challengeId(), record);
         if (existing != null) {
             return existing;
