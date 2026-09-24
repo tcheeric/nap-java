@@ -4,6 +4,12 @@ on:
   push:
     branches: [main, master, develop]
   pull_request:
+  # Manual runs, so a scan can be re-checked without inventing a commit. The two SCA
+  # jobs answer to things outside this repository: Dependency-Check needs the
+  # NVD_API_KEY secret and the NVD database behind it, and the OSV job queries a live
+  # advisory API. Both can change their answer with the source untouched, and until
+  # now the only way to ask again was to push something.
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -111,9 +117,10 @@ jobs:
   osv-scan:
     name: OSV vulnerability scan
     runs-on: ubuntu-latest
-    # The SCA that actually runs. Dependency-Check below needs an NVD API key and skips
-    # without one, so on a fork or before the secret exists it scans nothing while still
-    # reporting a green check. OSV needs no key and no 12 minute database build.
+    # The SCA that always runs. Dependency-Check below needs the NVD_API_KEY secret and
+    # skips without it, which still covers forks and any clone that does not carry the
+    # secret. OSV needs no key and no 12 minute database build, so it is the one scan
+    # that cannot be silently disabled by a missing credential.
     #
     # It earns its place rather than duplicating: on the first run it found bcprov 1.84
     # carrying a CRITICAL and a HIGH, and jackson-databind 2.21.4 carrying two MODERATEs.
@@ -194,10 +201,10 @@ jobs:
   dependency-check:
     name: OWASP Dependency-Check
     runs-on: ubuntu-latest
-    # Secondary to osv-scan above, which is the gate. This one reports without blocking
-    # because it cannot run at all without the NVD_API_KEY secret, and a check that turns
-    # red on a missing secret rather than a real finding is how a team learns to click past
-    # a scanner.
+    # Secondary to osv-scan above, which is the gate. The NVD_API_KEY secret was added on
+    # 2026-09-24, so this job now performs a real scan here rather than skipping, but it
+    # still skips on a fork or any clone without the secret. Reporting rather than
+    # blocking keeps that difference from turning into a red check about a credential.
     #
     # An earlier note here claimed 14 findings in spring-core and spring-security-core.
     # That was not reproducible and was retracted. A later note claimed the tree "currently
@@ -206,7 +213,9 @@ jobs:
     # them, bcprov 1.84, were CRITICAL and HIGH. Both claims came from a local run against
     # a populated database, which is a weaker check than it looks.
     #
-    # Keep it non-blocking until it has run green on a runner with a key a few times.
+    # Given that history, it stays non-blocking until it has run green on a runner with
+    # the key a few times. Promoting it before then would be trusting a third claim of
+    # the same shape as the two that were wrong.
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
