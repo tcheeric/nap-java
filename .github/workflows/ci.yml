@@ -42,34 +42,41 @@ jobs:
       # interop suite reports green while asserting nothing, which is precisely the silent
       # regression this CI exists to catch.
       #
-      # The clone target is not configurable: TypeScriptClientInteropTest hard-codes
-      # Path.of(user.home, "IdeaProjects", "nap") with no override property, so the path
-      # below has to match it exactly. OfficialTestVectorsTest does accept
-      # -Dnap.test-vectors.dir, but pointing both at one checkout keeps them consistent.
+      # Cloned into the workspace rather than $HOME: both tests now take an explicit
+      # directory property, so the location is chosen here instead of being dictated by a
+      # hard-coded home-relative path in test source.
       - name: Check out the TypeScript reference implementation
         run: |
-          git clone --depth 1 https://github.com/tcheeric/nap.git "$HOME/IdeaProjects/nap"
+          git clone --depth 1 https://github.com/tcheeric/nap.git "$GITHUB_WORKSPACE/../nap-ts"
+          echo "NAP_TS_DIR=$(cd "$GITHUB_WORKSPACE/../nap-ts" && pwd)" >> "$GITHUB_ENV"
 
       # The interop test looks for node_modules/.bin/tsx inside that checkout. Installing
       # dependencies is what flips the test from skipped to actually executed.
       - name: Install TypeScript client dependencies
-        run: npm ci --prefix "$HOME/IdeaProjects/nap"
+        run: npm ci --prefix "$NAP_TS_DIR"
 
       # A skipped test is indistinguishable from a passing one in a green check, so assert
       # the interop preconditions explicitly and fail loudly when they are missing.
       - name: Assert the interop toolchain is present
         run: |
-          test -x "$HOME/IdeaProjects/nap/node_modules/.bin/tsx" \
+          test -x "$NAP_TS_DIR/node_modules/.bin/tsx" \
             || { echo "tsx missing: the interop test would silently skip"; exit 1; }
-          test -f "$HOME/IdeaProjects/nap/packages/nap-core/test-vectors/nip98.json" \
+          test -f "$NAP_TS_DIR/packages/nap-core/test-vectors/nip98.json" \
             || { echo "test vectors missing: vector tests would silently skip"; exit 1; }
 
       # verify rather than test so the nap-it module runs as part of the reactor.
       # Note: every class in nap-it is named *Test, so surefire runs them all and the
       # configured failsafe plugin currently matches nothing. The interop coverage is real
       # but it arrives through surefire, not failsafe.
+      #
+      # Both interop directories are passed explicitly. Without them the tests fall back to
+      # a home-relative default that does not exist on a runner, and assumeTrue would skip
+      # them silently rather than fail.
       - name: Build and test
-        run: mvn -B -ntp verify
+        run: |
+          mvn -B -ntp verify \
+            -Dnap.typescript.dir="$NAP_TS_DIR" \
+            -Dnap.test-vectors.dir="$NAP_TS_DIR/packages/nap-core/test-vectors"
 
       # Publish the reports so skip counts stay reviewable rather than hidden behind a check.
       - name: Upload test reports
