@@ -66,6 +66,32 @@ turns an unannotated handler under a protected prefix into a `500`.
   rather than this filter's, and it does not survive a different container or a rewritten
   URI.
 
+- **Pinned `bcprov-jdk18on` 1.85 and `jackson-databind` 2.21.5**, closing four advisories
+  the audit missed entirely. bcprov 1.84 carried GHSA-9pwp-9qqc-pr26 (**critical**, a name
+  constraints bypass via a trailing dot in `rfc822Name` and URI) and GHSA-qp49-qgx5-5m26
+  (**high**, a lazy ASN.1 sequence resetting the nesting-depth guard). That is the provider
+  behind Schnorr verification on the unauthenticated NIP-98 path. jackson-databind 2.21.4
+  carried two moderate `@JsonView` deserialization bypasses, and Jackson parses
+  attacker-controlled JSON in `Nip98Validator` and `DefaultNapServer`.
+
+  Both arrive transitively through `nostr-java-core`, so nothing in this repository names
+  either version. Each pin is the lowest release carrying the fix, and each can be dropped
+  once `imani-bom` catches up.
+
+  Found by the new OSV job below, not by the audit, and not by Dependency-Check either. The
+  earlier claim in the CI config that the tree "scanned clean" came from a local run and was
+  wrong.
+
+- **Added an OSV scan to CI, and it gates merges** (#32). Dependency-Check cannot run
+  without an `NVD_API_KEY` secret, so until that exists it skips and reports green while
+  scanning nothing. OSV needs no key.
+
+  It scans the resolved dependency tree rather than the poms: `osv-scanner` reads `pom.xml`
+  directly, but this is a multi-module build whose siblings are in no registry, so
+  resolution fails per module and it reports "0 packages affected by 0 known
+  vulnerabilities". A green result that scanned nothing is worse than no scan. The job
+  exits non-zero if it parses no packages, for the same reason.
+
 - **`protected-path-prefixes` fails closed** (#29).
   `nap.require-annotation-on-protected-paths` now defaults to `true`, so a handler under a
   protected prefix that declares no NAP annotation is refused rather than served to anyone.

@@ -95,24 +95,95 @@ jobs:
             **/target/failsafe-reports/**
           if-no-files-found: warn
 
+  osv-scan:
+    name: OSV vulnerability scan
+    runs-on: ubuntu-latest
+    # The SCA that actually runs. Dependency-Check below needs an NVD API key and skips
+    # without one, so on a fork or before the secret exists it scans nothing while still
+    # reporting a green check. OSV needs no key and no 12 minute database build.
+    #
+    # It earns its place rather than duplicating: on the first run it found bcprov 1.84
+    # carrying a CRITICAL and a HIGH, and jackson-databind 2.21.4 carrying two MODERATEs.
+    # Both arrive transitively through nostr-java-core, so nothing in this repository
+    # names them, which is exactly the blind spot an SCA job exists to cover.
+    #
+    # Blocking, unlike Dependency-Check. A scan that cannot run without a secret must not
+    # gate a merge; this one can always run, so it can.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: temurin
+          cache: maven
+
+      # Scanning the resolved tree, not the poms. osv-scanner reads pom.xml directly, but
+      # this is a multi-module build whose siblings are not in any registry, so resolution
+      # fails per module and it reports "0 packages affected by 0 known vulnerabilities":
+      # a green result that scanned nothing. Verified locally before choosing this route.
+      # `mvn dependency:tree` resolves against the real BOM, including the overrides in the
+      # parent pom, so what gets scanned is what actually ships.
+      - name: Resolve the dependency tree
+        run: mvn -q -B -ntp dependency:tree -DoutputFile=deptree.txt -DappendOutput=true
+
+      - name: Query OSV
+        run: |
+          python3 - <<'PY'
+          import json, re, sys, urllib.request
+
+          # Third-party runtime and compile dependencies only. The xyz.tcheeric modules are
+          # this build's own artifacts and exist in no advisory database.
+          packages = {}
+          for line in open('deptree.txt'):
+              match = re.search(r'([\w.\-]+):([\w.\-]+):jar:([\w.\-]+):(compile|runtime)', line)
+              if match:
+                  group, artifact, version, _ = match.groups()
+                  if not group.startswith('xyz.tcheeric'):
+                      packages[f'{group}:{artifact}'] = version
+
+          if not packages:
+              sys.exit('No packages parsed from deptree.txt: the scan would pass vacuously.')
+
+          ordered = sorted(packages.items())
+          payload = json.dumps({'queries': [
+              {'package': {'name': name, 'ecosystem': 'Maven'}, 'version': version}
+              for name, version in ordered
+          ]}).encode()
+
+          request = urllib.request.Request('https://api.osv.dev/v1/querybatch', data=payload)
+          results = json.load(urllib.request.urlopen(request, timeout=120))['results']
+
+          findings = []
+          for (name, version), result in zip(ordered, results):
+              ids = [v['id'] for v in (result.get('vulns') or [])]
+              if ids:
+                  findings.append(f'{name}@{version}: {", ".join(ids)}')
+
+          print(f'Scanned {len(ordered)} third-party packages.')
+          for finding in findings:
+              print(f'::error title=Known vulnerability::{finding}')
+
+          if findings:
+              sys.exit(f'{len(findings)} package(s) with known advisories.')
+          print('No known advisories.')
+          PY
+
   dependency-check:
     name: OWASP Dependency-Check
     runs-on: ubuntu-latest
-    # Reports without blocking, for now, even though the tree currently scans clean.
+    # Secondary to osv-scan above, which is the gate. This one reports without blocking
+    # because it cannot run at all without the NVD_API_KEY secret, and a check that turns
+    # red on a missing secret rather than a real finding is how a team learns to click past
+    # a scanner.
     #
     # An earlier note here claimed 14 findings in spring-core and spring-security-core.
-    # That was not reproducible: re-running dependency-check 13.0.0 on 2026-09-24 with a
-    # populated NVD database (232 MB, updated during the run) reports BUILD SUCCESS at
-    # -DfailBuildOnCVSS=7, and also at -DfailBuildOnCVSS=0, which fails on a finding of
-    # any severity. The likely cause of the original number was a run that could not
-    # update the NVD feed, since an empty NVD_API_KEY is rejected outright rather than
-    # ignored.
+    # That was not reproducible and was retracted. A later note claimed the tree "currently
+    # scans clean", which was also wrong, just less visibly: this job had never run on a
+    # runner, and OSV found four advisories the moment anything actually scanned. Two of
+    # them, bcprov 1.84, were CRITICAL and HIGH. Both claims came from a local run against
+    # a populated database, which is a weaker check than it looks.
     #
-    # It stays non-blocking anyway, for a reason that does not depend on the count: this
-    # job has never executed on a runner. Making an unproven scanner a merge gate on its
-    # first outing risks blocking every PR on an environment problem rather than a real
-    # finding, which is how a team learns to click past a scanner. Remove this line once
-    # the job has run green in CI a few times, so the gate actually bites.
+    # Keep it non-blocking until it has run green on a runner with a key a few times.
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
