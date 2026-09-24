@@ -283,6 +283,18 @@ jobs:
           restore-keys: |
             nvd-${{ runner.os }}-
 
+      # A cached lock file is worse than no cache. dependency-check takes an exclusive
+      # lock while it updates, and a run that dies mid-update leaves odc.update.lock
+      # behind. Cached, that lock is restored into every later run, which then waits for
+      # an update that finished hours ago on a machine that no longer exists: observed as
+      # a 40 minute wait ending in "Unable to obtain an exclusive lock on the H2
+      # database". The lock is meaningful only within one run, so it is cleared on
+      # restore rather than trusted.
+      #
+      # The save step below excludes it too, so a failed run cannot poison the next one.
+      - name: Clear any stale update lock
+        run: rm -f ~/.m2/repository/org/owasp/dependency-check-data/*.lock
+
       # The dependency tree is managed by imani-bom, so transitive CVEs arrive without any
       # visible version bump in this repository. Jackson matters directly: Nip98Validator
       # and DefaultNapServer parse attacker-controlled JSON on the unauthenticated path.
@@ -357,6 +369,15 @@ jobs:
       # hit, and this always writes a fresh entry. That is deliberate rather than
       # wasteful. The database is updated in place by each run, so the new entry holds
       # the previous database plus today's delta, and the next run starts from it.
+      #
+      # The lock is dropped first. A run cancelled or killed mid-update leaves
+      # odc.update.lock behind, and caching it hands every later run a 40 minute wait on
+      # a lock that will never be released. That is what poisoned the first cache this
+      # job ever wrote.
+      - name: Drop the update lock before caching
+        if: always()
+        run: rm -f ~/.m2/repository/org/owasp/dependency-check-data/*.lock
+
       - name: Save the NVD database
         if: always()
         uses: actions/cache/save@v4
