@@ -288,6 +288,42 @@ class NapSessionFilterTest {
         );
     }
 
+    /**
+     * Protection must not depend on the servlet context path (#29).
+     *
+     * <p>This filter matched the raw {@code getRequestURI()} while NapPermissionInterceptor
+     * stripped the context path first, so a deployment under {@code /app} had a filter that
+     * skipped authentication on requests the interceptor believed were guarded. With the
+     * interceptor now failing closed by default, that disagreement decides whether a request is
+     * authenticated at all.
+     */
+    @Test
+    void doFilterInternal_appliesProtectionUnderANonEmptyContextPath() throws Exception {
+        SessionRecord session = sessionRecord();
+        when(sessionStore.getByAccessToken("access-token-123")).thenReturn(Optional.of(session));
+        when(aclResolver.resolve(session.principalNpub(), session.principalPubkey()))
+                .thenReturn(AclDecision.allowed(List.of("merchant"), List.of("read")));
+
+        NapSessionFilter filter = new NapSessionFilter(
+                sessionStore, aclResolver, "merchant_session",
+                List.of("/internal/v1/merchants"), Duration.ofMinutes(5)
+        );
+
+        MockHttpServletRequest request =
+                new MockHttpServletRequest("POST", "/app/internal/v1/merchants/test/suspend");
+        request.setContextPath("/app");
+        request.setCookies(new Cookie("merchant_session", "access-token-123"));
+
+        AtomicReference<Authentication> captured = new AtomicReference<>();
+        filter.doFilterInternal(request, new MockHttpServletResponse(), (req, res) ->
+                captured.set(SecurityContextHolder.getContext().getAuthentication()));
+
+        // The prefix matches only once the context path is stripped, so an authentication
+        // being present is what proves the filter treated this as protected.
+        assertThat(captured.get()).isNotNull();
+        assertThat(captured.get().isAuthenticated()).isTrue();
+    }
+
     private SessionRecord sessionRecord() {
         long now = java.time.Instant.now().getEpochSecond();
         return SessionRecord.create(
