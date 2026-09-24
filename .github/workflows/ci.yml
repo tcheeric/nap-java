@@ -92,15 +92,21 @@ jobs:
   dependency-check:
     name: OWASP Dependency-Check
     runs-on: ubuntu-latest
-    # Reports without blocking, for now. Verified locally on 2026-09-24 against
-    # dependency-check 13.0.0: -DfailBuildOnCVSS=7 FAILS today on the current tree,
-    # flagging 12 CVEs in spring-core 6.2.19 and 2 in spring-security-core 6.5.11.
+    # Reports without blocking, for now, even though the tree currently scans clean.
     #
-    # Making this blocking immediately would turn every PR red for a pre-existing
-    # condition that no PR author introduced or can fix, which is the fastest way to
-    # teach a team to ignore a scanner. The correct order is: land the signal, triage
-    # the 14 findings (upgrade through imani-bom, or suppress the CPE false positives
-    # that spring-core is well known for), then remove this line so the gate bites.
+    # An earlier note here claimed 14 findings in spring-core and spring-security-core.
+    # That was not reproducible: re-running dependency-check 13.0.0 on 2026-09-24 with a
+    # populated NVD database (232 MB, updated during the run) reports BUILD SUCCESS at
+    # -DfailBuildOnCVSS=7, and also at -DfailBuildOnCVSS=0, which fails on a finding of
+    # any severity. The likely cause of the original number was a run that could not
+    # update the NVD feed, since an empty NVD_API_KEY is rejected outright rather than
+    # ignored.
+    #
+    # It stays non-blocking anyway, for a reason that does not depend on the count: this
+    # job has never executed on a runner. Making an unproven scanner a merge gate on its
+    # first outing risks blocking every PR on an environment problem rather than a real
+    # finding, which is how a team learns to click past a scanner. Remove this line once
+    # the job has run green in CI a few times, so the gate actually bites.
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
