@@ -84,6 +84,19 @@ jobs:
             -Dnap.typescript.dir="$NAP_TS_DIR" \
             -Dnap.test-vectors.dir="$NAP_TS_DIR/packages/nap-core/test-vectors"
 
+      # `cache: maven` restores ~/.m2 between runs, so a first-party artifact that ever
+      # gets overwritten there persists across builds. Maven checks a checksum when it
+      # downloads and never again, and `-C` does not change that: strict checksums apply
+      # to transport, not to what is already on disk. Verified, since -C was the first
+      # fix proposed for this and it does not work.
+      #
+      # Today the build runs `verify` rather than `install`, so nothing here writes
+      # xyz.tcheeric into the cache and this should always pass. That is the point of
+      # running it: the day someone adds an `install`, this is what notices. See #37.
+      - name: Check the Maven cache for overwritten releases
+        if: always()
+        run: python3 check-m2-integrity.py
+
       # Publish the reports so skip counts stay reviewable rather than hidden behind a check.
       - name: Upload test reports
         if: always()
