@@ -298,8 +298,38 @@ jobs:
           NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
         run: |
           if [ -n "$NVD_API_KEY" ]; then
-            mvn -B -ntp org.owasp:dependency-check-maven:check \
-              -DfailBuildOnCVSS=7 -DnvdApiKey="$NVD_API_KEY"
+            # `install` before the goal, not the goal on its own. Invoking
+            # dependency-check-maven:check directly runs it per module without building
+            # anything, so module 2 onwards tries to resolve xyz.tcheeric:nap-core:0.9.0
+            # from the repositories and fails: this version is not published yet, and a
+            # release under development never is. Attaching the goal to a lifecycle run
+            # puts each module's own jar in the local repository before its dependents
+            # need it.
+            #
+            # This hid behind the NVD problem. Every earlier run died during the database
+            # update, on module 1, so nothing ever reached module 2 to discover it. The
+            # first run that got a working key spent 50 minutes downloading and then
+            # failed here.
+            #
+            # -DskipTests because `build` already ran the suite; this job wants the
+            # artifacts, not a second test run.
+            #
+            # The install goes to a repository private to this job, not to the cached
+            # ~/.m2. `cache: maven` persists that directory across runs, so installing
+            # 0.9.0 into it would leave a locally built copy of a release coordinate
+            # sitting in a shared cache: precisely the hazard #37 covers, where a build
+            # overwrites a published artifact and nothing notices.
+            #
+            # dataDirectory has to be named explicitly alongside it. The NVD database
+            # defaults to a path inside the local repository, so moving the repository
+            # would move the database out from under the cache above and buy an 80 minute
+            # rebuild every night. Pointing it back at the cached location keeps the two
+            # decisions independent: artifacts isolated, database shared.
+            mvn -B -ntp \
+              -Dmaven.repo.local="$RUNNER_TEMP/dc-repo" \
+              -DdataDirectory="$HOME/.m2/repository/org/owasp/dependency-check-data" \
+              install org.owasp:dependency-check-maven:check \
+              -DskipTests -DfailBuildOnCVSS=7 -DnvdApiKey="$NVD_API_KEY"
           else
             echo "::warning title=Dependency-Check skipped::NVD_API_KEY secret is not set, so the NVD database cannot be built and no scan ran. Add the secret (free key: https://nvd.nist.gov/developers/request-an-api-key) to enable this job."
             echo "Skipping the scan: without an API key the NVD update fails outright rather"
