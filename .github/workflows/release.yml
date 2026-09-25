@@ -1,0 +1,143 @@
+name: Release
+
+# Publishing did not exist in this repository, and the absence was invisible here.
+#
+# The root pom has said 0.9.0 since that work landed, but the newest tag was v0.8.0 and
+# there was no release workflow of any kind, so nap-spring and nap-jdbc 0.9.0 were never
+# published. Reposilite answers HTTP 404 for them while 0.8.0 answers 200.
+#
+# The damage landed on consumers. Every imani-bom from 0.1.106 onward pins nap-java 0.9.0,
+# so cashu-mint's CI failed to resolve nap-spring while the same build passed on a
+# developer machine, which had a locally installed 0.9.0 in ~/.m2. That difference is the
+# whole failure mode: a local `mvn install` makes an unpublished version look published to
+# exactly one person.
+#
+# Ported from cashu-vault, which lost publishing a different way (a docs commit deleted its
+# workflow as collateral) and fixed it with this shape. The gate at the end is the point:
+# without it, "the workflow is green" and "the artifacts exist" stay two different
+# statements, and the gap can go unnoticed for months.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish and verify, e.g. 0.9.0'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      # Fail before building rather than after. Maven treats an unauthenticated upload
+      # target as nothing to do and exits 0, which is how a release reports success and
+      # ships nothing.
+      #
+      # Three spellings of the same credential exist across this org: cashu-mint was
+      # provisioned with MVN_USER, cashu-vault and imani-wallet-lib with MVN_USERNAME, and
+      # imani-bom publishes using an org-level REPOSILITE_USERNAME. A release that fails
+      # over which of three names someone typed is a wasted outage, so all three are
+      # accepted. The guard still refuses when NONE is set, which is the case that protects
+      # anything.
+      - name: Verify publish credentials are present
+        env:
+          MVN_USER: ${{ secrets.MVN_USER || secrets.MVN_USERNAME || secrets.REPOSILITE_USERNAME }}
+          MVN_PASSWORD: ${{ secrets.MVN_PASSWORD || secrets.REPOSILITE_PASSWORD }}
+        run: |
+          if [ -z "${MVN_USER}" ] || [ -z "${MVN_PASSWORD}" ]; then
+            echo "::error::No publish credentials are set on this repository."
+            echo "::error::The deploy would publish nothing and still report success,"
+            echo "::error::which is exactly how nap 0.9.0 went missing."
+            echo "::error::Add MVN_USER/MVN_PASSWORD under"
+            echo "::error::Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+
+      - name: Check the tag matches the pom version
+        env:
+          VERSION: ${{ inputs.version || github.ref_name }}
+        run: |
+          want="${VERSION#v}"
+          # Read the version from the XML rather than asking Maven. help:evaluate has to
+          # build an effective model, which means resolving whatever the pom imports, and
+          # this step runs BEFORE settings.xml is written. On a private-registry project it
+          # can then fail for want of credentials and print that error into the captured
+          # stdout, reporting a credentials problem as a version mismatch.
+          have=$(python3 -c "import xml.etree.ElementTree as ET; print(ET.parse('pom.xml').getroot().findtext('{http://maven.apache.org/POM/4.0.0}version'))")
+          if [ "${want}" != "${have}" ]; then
+            echo "::error::tag says ${want} but the root pom says ${have}"
+            exit 1
+          fi
+          echo "releasing ${have}"
+
+      # The step above reads only the ROOT pom, so a root-only bump would pass it while
+      # leaving the modules behind.
+      - name: Check every module is at the root version
+        run: python3 .github/scripts/check-module-versions.py
+
+      - name: Configure Maven settings
+        run: |
+          mkdir -p "${HOME}/.m2"
+          cat <<'EOF' > "${HOME}/.m2/settings.xml"
+          <settings xmlns="http://maven.apache.org/SETTINGS/1.0.0"
+                    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                    xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.0.0 https://maven.apache.org/xsd/settings-1.0.0.xsd">
+            <servers>
+              <server>
+                <id>reposilite-releases</id>
+                <username>${env.MVN_USER}</username>
+                <password>${env.MVN_PASSWORD}</password>
+              </server>
+              <server>
+                <id>reposilite-snapshots</id>
+                <username>${env.MVN_USER}</username>
+                <password>${env.MVN_PASSWORD}</password>
+              </server>
+            </servers>
+          </settings>
+          EOF
+
+      # skipTests, not skipped modules. The whole reactor deploys, including nap-it, because
+      # nap-it declares no deploy skip and verify-published.py checks every module the
+      # reactor builds: publishing a subset would fail that gate, correctly.
+      #
+      # Tests are skipped here because CI already ran them on the commit being tagged, and
+      # nap-it's suite needs services this job does not start. A release job that can fail
+      # on test infrastructure is a release job that publishes nothing for reasons unrelated
+      # to publishing.
+      #
+      # gpg.skip matches how the sibling repositories release: Reposilite does not require
+      # signatures, and a signing key configured but unused fails the build for no benefit.
+      - name: Build and deploy to Reposilite
+        env:
+          MVN_USER: ${{ secrets.MVN_USER || secrets.MVN_USERNAME || secrets.REPOSILITE_USERNAME }}
+          MVN_PASSWORD: ${{ secrets.MVN_PASSWORD || secrets.REPOSILITE_PASSWORD }}
+        run: mvn -B -U clean deploy -Dgpg.skip=true -DskipTests
+
+      # The gate. A green deploy step is not evidence that anything resolves, which is the
+      # entire reason 0.9.0 was pinned by five BOM releases while returning 404.
+      - name: Verify the artifacts are resolvable
+        env:
+          VERSION: ${{ inputs.version || github.ref_name }}
+        run: python3 .github/scripts/verify-published.py
+
+      - name: Create GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
