@@ -422,6 +422,21 @@ class NapAuthControllerTest {
         assertThat(after.lastActivityAt()).isGreaterThan(Instant.now().getEpochSecond() - 5);
     }
 
+    /** An Error from the resolver (e.g. a missing class) fails closed too, never a 500. */
+    @Test
+    void checkSession_aclThatThrowsAnError_keepsTheSessionButGrantsNothing() {
+        seedLive("token-err", List.of("merchant"), List.of("coupon:issue"));
+
+        ResponseEntity<?> response = liveController((npub, pubkey) -> {
+            throw new NoClassDefFoundError("acl/Missing");
+        }).checkSession(sessionRequest("token-err"));
+
+        assertThat(response.getStatusCode().value()).isEqualTo(200);
+        assertThat(body(response)).containsEntry("roles", List.of());
+        assertThat(body(response)).containsEntry("permissions", List.of());
+        assertThat(sessionStore.getBySessionId("sid-token-err").orElseThrow().revokedAt()).isNull();
+    }
+
     /** "Denied" from a resolver that could not read the ACL is the same transient case. */
     @Test
     void checkSession_uncertainDenial_keepsTheSessionButGrantsNothing() {

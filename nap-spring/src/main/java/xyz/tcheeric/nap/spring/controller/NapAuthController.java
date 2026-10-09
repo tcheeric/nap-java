@@ -386,7 +386,7 @@ public class NapAuthController {
         AclDecision decision;
         try {
             decision = aclResolver.resolve(record.principalNpub(), record.principalPubkey());
-        } catch (RuntimeException e) {
+        } catch (Throwable e) { // Errors too (SEC-12): fail closed with no grants, never a 500
             log.warn("nap_session_acl_unavailable pubkey={} error={}",
                     record.principalPubkey(), e.getClass().getSimpleName());
             return Grants.NONE;
