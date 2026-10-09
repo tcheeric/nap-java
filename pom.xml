@@ -26,7 +26,7 @@
         <maven.compiler.target>${java.version}</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
 
-        <imani-bom.version>0.1.81</imani-bom.version>
+        <imani-bom.version>0.1.87</imani-bom.version>
 
         <!-- Security overrides of versions imani-bom resolves transitively. Each is the
              lowest release that carries the fix, so the override is a patch bump rather
