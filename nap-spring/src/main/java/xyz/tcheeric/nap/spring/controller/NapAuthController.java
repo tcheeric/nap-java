@@ -9,6 +9,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
+import xyz.tcheeric.nap.core.AclDecision;
 import xyz.tcheeric.nap.core.NapErrorCode;
 import xyz.tcheeric.nap.core.SessionRecord;
 import xyz.tcheeric.nap.core.SessionStore;
@@ -32,6 +33,10 @@ import java.util.Map;
  * contract: on success it advances the session's {@code last_activity_at} and
  * returns {@code {pubkey, expires_at, absolute_expiry_at}}. On failure it
  * returns {@code 401 {error, reason}} with {@code reason=expired|invalid}.
+ *
+ * <p>Its {@code roles} and {@code permissions} are resolved live through the {@link AclResolver}
+ * on every call, not read off the session row, which holds what the ACL said at login and is
+ * never rewritten. See {@link #checkSession}.
  */
 @RestController
 @RequestMapping("/api/v1/auth")
@@ -57,6 +62,12 @@ public class NapAuthController {
     private final AudienceResolver audienceResolver;
     private final RawBodyExtractor rawBodyExtractor;
     private final ClientIpResolver clientIpResolver;
+    /**
+     * Answers {@code /auth/session}'s roles and permissions. {@code null} only for a controller
+     * hand-wired through one of the older constructors, which keeps their behaviour: the row's
+     * login-time grants. The auto-configured controller always has one.
+     */
+    private final AclResolver aclResolver;
 
     public NapAuthController(NapServer napServer, SessionStore sessionStore,
                              NapProperties properties, ObjectMapper objectMapper) {
@@ -85,6 +96,21 @@ public class NapAuthController {
                              NapProperties properties, ObjectMapper objectMapper,
                              AudienceResolver audienceResolver, RawBodyExtractor rawBodyExtractor,
                              ClientIpResolver clientIpResolver) {
+        this(napServer, sessionStore, properties, objectMapper, audienceResolver, rawBodyExtractor,
+                clientIpResolver, null);
+    }
+
+    /**
+     * @param aclResolver what {@code GET /auth/session} resolves the caller's roles and
+     *                    permissions through, live, on every call. {@code null} falls back to
+     *                    the grants frozen on the session row at login, which is the behaviour
+     *                    this parameter exists to replace (imani-wallet#114).
+     */
+    public NapAuthController(NapServer napServer, SessionStore sessionStore,
+                             NapProperties properties, ObjectMapper objectMapper,
+                             AudienceResolver audienceResolver, RawBodyExtractor rawBodyExtractor,
+                             ClientIpResolver clientIpResolver, AclResolver aclResolver) {
+        this.aclResolver = aclResolver;
         this.clientIpResolver = clientIpResolver != null
                 ? clientIpResolver
                 : ClientIpResolver.remoteAddr();
@@ -236,6 +262,37 @@ public class NapAuthController {
      * Validate the session cookie, slide its idle window, and return the
      * pubkey + expiries. On any failure return {@code 401} with a typed
      * {@code reason} so the client can display the correct end-reason copy.
+     *
+     * <h2>Roles and permissions are resolved now, not read off the row</h2>
+     *
+     * <p>The row holds what the ACL said at login, and nothing rewrites it: the session filter's
+     * refresh lives in memory for one request, and refresh is opt-in. Returning it here meant a
+     * principal whose grants changed after login kept the old answer for the life of the
+     * session, up to the absolute cap. That cut both ways. A merchant whose stall record reached
+     * the ACL a second after their login stayed a customer until they logged out, because a
+     * reload resumes this same row (imani-wallet#114). And one whose grant was taken away kept
+     * offering it client-side for just as long.
+     *
+     * <p>Cost: one {@link AclResolver#resolve} per call. This endpoint is read on resume, not
+     * per request, and resolvers that sit on the request path already cache their own answer.
+     *
+     * <h2>When the ACL cannot answer</h2>
+     *
+     * <p>The same split the session filter and refresh make, applied to what this endpoint is
+     * for, which is telling a client whether it still has a session:
+     * <ul>
+     *   <li><b>A denial the resolver is certain about</b> ({@link AclDecision#revokeSessions()},
+     *       a suspension) ends every session the principal holds and answers {@code 401
+     *       invalid}. That is not a session with no permissions; it is not a session.</li>
+     *   <li><b>Anything else</b>, a resolver that throws or answers "denied" because it could
+     *       not read the ACL, keeps the session and answers {@code 200} with <em>no</em> roles
+     *       and <em>no</em> permissions. Closed, because nothing is granted on a read that
+     *       failed, including the row's login-time grants, which may be the very thing that was
+     *       taken away. But not a logout, and not a 5xx: the browser client treats a 401 as the
+     *       end of the session and a 5xx as a failed resume, and either one sends the user back
+     *       to their passphrase over a fault in someone else's store. The next read, once the
+     *       ACL answers again, restores the grants.</li>
+     * </ul>
      */
     @GetMapping("/session")
     public ResponseEntity<?> checkSession(HttpServletRequest request) {
@@ -257,6 +314,14 @@ public class NapAuthController {
             return sessionEnded("expired");
         }
 
+        // Before the slide: a principal the ACL has just suspended must not have their idle
+        // window extended on the way out.
+        Grants grants = currentGrants(record);
+        if (grants == null) {
+            sessionStore.revokeByPrincipal(record.principalPubkey(), now);
+            return sessionEnded("invalid");
+        }
+
         // Slide the idle window: advance last_activity_at to `now` and bump
         // expires_at forward to `now + idleTtl`, capped at absolute_expiry_at.
         long idleTtl = properties.sessionIdleTtlSeconds();
@@ -274,8 +339,8 @@ public class NapAuthController {
         principal.put("npub", record.principalNpub());
         principal.put("pubkey", record.principalPubkey());
         body.put("principal", principal);
-        body.put("roles", record.roles() == null ? List.of() : record.roles());
-        body.put("permissions", record.permissions() == null ? List.of() : record.permissions());
+        body.put("roles", grants.roles());
+        body.put("permissions", grants.permissions());
         body.put("expires_at", newExpiresAt);
         body.put("absolute_expiry_at", record.absoluteExpiryAt());
 
@@ -298,6 +363,49 @@ public class NapAuthController {
         }
         clearCookie(response);
         return ResponseEntity.noContent().build();
+    }
+
+    private record Grants(List<String> roles, List<String> permissions) {
+        static final Grants NONE = new Grants(List.of(), List.of());
+
+        static Grants of(List<String> roles, List<String> permissions) {
+            return new Grants(roles == null ? List.of() : roles,
+                    permissions == null ? List.of() : permissions);
+        }
+    }
+
+    /**
+     * The principal's grants as the ACL answers them now, {@link Grants#NONE} when it cannot
+     * answer, or {@code null} when it affirmatively ended the principal's sessions. See
+     * {@link #checkSession} for why the two failures differ.
+     */
+    private Grants currentGrants(SessionRecord record) {
+        if (aclResolver == null) {
+            return Grants.of(record.roles(), record.permissions());
+        }
+        AclDecision decision;
+        try {
+            decision = aclResolver.resolve(record.principalNpub(), record.principalPubkey());
+        } catch (RuntimeException e) {
+            log.warn("nap_session_acl_unavailable pubkey={} error={}",
+                    record.principalPubkey(), e.getClass().getSimpleName());
+            return Grants.NONE;
+        }
+        if (decision == null) {
+            log.warn("nap_session_acl_unavailable pubkey={} error=null_decision", record.principalPubkey());
+            return Grants.NONE;
+        }
+        if (decision.allowed()) {
+            return Grants.of(decision.roles(), decision.permissions());
+        }
+        if (decision.revokeSessions()) {
+            log.warn("nap_session_acl_denied pubkey={} reason={} revoking=true",
+                    record.principalPubkey(), decision.reason());
+            return null;
+        }
+        log.warn("nap_session_acl_denied pubkey={} reason={} revoking=false",
+                record.principalPubkey(), decision.reason());
+        return Grants.NONE;
     }
 
     private ResponseEntity<Map<String, Object>> sessionEnded(String reason) {

@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **`GET /api/v1/auth/session` resolves roles and permissions through the `AclResolver` on
+  every call** instead of returning the grants frozen on the session row at login
+  (398ja/imani-wallet#114). Nothing ever rewrote that row: `NapSessionFilter`'s refresh is
+  per-request and in memory, and refresh tokens are opt-in. So a principal whose ACL changed
+  after login kept the old answer until the session ended, up to the absolute cap, in both
+  directions. A merchant whose stall record reached the ACL a second after their login stayed
+  a customer (a reload resumes the same row), and a grant taken away stayed visible to the
+  client.
+
+  Failure semantics follow the existing split between a certain and an uncertain denial:
+  - an affirmative denial (`AclDecision.revokeSessions()`, e.g. a suspension) revokes every
+    session of the principal and answers `401 {reason: invalid}`;
+  - a resolver that throws, or denies without certainty, keeps the session, still slides it,
+    and answers `200` with **empty** roles and permissions. Fails closed (the login-time grants
+    are not used as a fallback, they may be what was taken away) without logging the user out
+    or turning a store fault into a 5xx the browser client treats as a failed resume.
+
+  The auto-configured controller passes the application's `AclResolver`. A new 8-argument
+  constructor takes it; the existing constructors are unchanged and keep the old behaviour, so
+  a hand-wired controller must opt in. Cost is one `resolve()` per `/auth/session` call.
+
 ## [0.9.0] - 2026-09-24
 
 Minor rather than patch: three of these change behaviour, and one ends every live session
