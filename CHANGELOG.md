@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-10-09
+
+Patch: one fix, no API removed. The new 8-argument `NapAuthController` constructor is
+additive and the auto-configuration wires it, so a Spring Boot consumer needs no change.
+
 ### Fixed
 
 - **`GET /api/v1/auth/session` resolves roles and permissions through the `AclResolver` on
