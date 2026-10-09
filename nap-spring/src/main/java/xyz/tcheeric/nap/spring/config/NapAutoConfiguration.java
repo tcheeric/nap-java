@@ -156,6 +156,7 @@ public class NapAutoConfiguration {
     @ConditionalOnMissingBean
     public NapAuthController napAuthController(NapServer napServer, SessionStore sessionStore,
                                                NapProperties properties,
+                                               AclResolver aclResolver,
                                                com.fasterxml.jackson.databind.ObjectMapper objectMapper,
                                                ObjectProvider<AudienceResolver> audienceResolverProvider,
                                                ObjectProvider<RawBodyExtractor> rawBodyExtractorProvider,
@@ -175,7 +176,10 @@ public class NapAutoConfiguration {
         return new NapAuthController(napServer, sessionStore, properties, objectMapper,
                 audienceResolverProvider.getIfAvailable(),
                 rawBodyExtractorProvider.getIfAvailable(),
-                clientIpResolver);
+                clientIpResolver,
+                // /auth/session answers grants live through the same resolver the login used,
+                // rather than the copy frozen on the row at login (imani-wallet#114).
+                aclResolver);
     }
 
     @Bean

@@ -6,6 +6,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.http.ResponseEntity;
 import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.mock.web.MockHttpServletResponse;
+import xyz.tcheeric.nap.core.AclDecision;
 import xyz.tcheeric.nap.core.AuthFailureResponse;
 import xyz.tcheeric.nap.core.AuthInitResponse;
 import xyz.tcheeric.nap.core.AuthSuccessResponse;
@@ -320,6 +321,177 @@ class NapAuthControllerTest {
         Map<String, Object> body = (Map<String, Object>) response.getBody();
         long newExpiresAt = ((Number) body.get("expires_at")).longValue();
         assertThat(newExpiresAt).isEqualTo(absoluteExpiry);
+    }
+
+    // -----------------------------------------------------------------
+    // /auth/session resolves grants live (imani-wallet#114)
+    // -----------------------------------------------------------------
+
+    private static final String LIVE_PUBKEY = "e".repeat(64);
+
+    /** A session row whose login-time grants were {@code roles}/{@code permissions}. */
+    private void seedLive(String token, List<String> roles, List<String> permissions) {
+        long now = Instant.now().getEpochSecond();
+        sessionStore.createForChallenge(SessionRecord.create(
+                "sid-" + token, "chal-" + token, token,
+                "npub-live", LIVE_PUBKEY,
+                roles, permissions,
+                now - 60, now - 60, now + 300, now + 43200));
+    }
+
+    private NapAuthController liveController(xyz.tcheeric.nap.server.AclResolver resolver) {
+        return new NapAuthController(napServer, sessionStore, properties, objectMapper,
+                null, null, null, resolver);
+    }
+
+    private static MockHttpServletRequest sessionRequest(String token) {
+        MockHttpServletRequest request = new MockHttpServletRequest("GET", "/api/v1/auth/session");
+        request.setCookies(new Cookie("merchant_session", token));
+        return request;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> body(ResponseEntity<?> response) {
+        return (Map<String, Object>) response.getBody();
+    }
+
+    /**
+     * The #114 direction: logged in as a customer because the merchant record had not reached the
+     * ACL yet, then the ACL caught up. A resume must see the merchant, not the login-time row.
+     */
+    @Test
+    void checkSession_returnsGrantsTheAclGivesNow_notTheOnesFrozenAtLogin() {
+        seedLive("token-grow", List.of("customer"), List.of("wallet:read"));
+        var acl = new java.util.concurrent.atomic.AtomicReference<>(
+                AclDecision.allowed(List.of("merchant"), List.of("wallet:read", "coupon:issue")));
+
+        ResponseEntity<?> response = liveController((npub, pubkey) -> acl.get())
+                .checkSession(sessionRequest("token-grow"));
+
+        assertThat(response.getStatusCode().value()).isEqualTo(200);
+        assertThat(body(response)).containsEntry("roles", List.of("merchant"));
+        assertThat(body(response)).containsEntry("permissions", List.of("wallet:read", "coupon:issue"));
+    }
+
+    /** The other direction: a grant taken away after login must drop on the next read. */
+    @Test
+    void checkSession_dropsAGrantTheAclHasSinceTakenAway() {
+        seedLive("token-shrink", List.of("merchant"), List.of("wallet:read", "coupon:issue"));
+
+        ResponseEntity<?> response = liveController(
+                (npub, pubkey) -> AclDecision.allowed(List.of("customer"), List.of("wallet:read")))
+                .checkSession(sessionRequest("token-shrink"));
+
+        assertThat(response.getStatusCode().value()).isEqualTo(200);
+        assertThat(body(response)).containsEntry("roles", List.of("customer"));
+        assertThat(body(response)).containsEntry("permissions", List.of("wallet:read"));
+    }
+
+    /** Each read asks again: the second resume sees a change made after the first. */
+    @Test
+    void checkSession_asksTheResolverOnEveryRead() {
+        seedLive("token-twice", List.of("customer"), List.of());
+        var acl = new java.util.concurrent.atomic.AtomicReference<>(
+                AclDecision.allowed(List.of("customer"), List.of()));
+        var controller = liveController((npub, pubkey) -> acl.get());
+
+        assertThat(body(controller.checkSession(sessionRequest("token-twice"))))
+                .containsEntry("permissions", List.of());
+        acl.set(AclDecision.allowed(List.of("merchant"), List.of("coupon:issue")));
+        assertThat(body(controller.checkSession(sessionRequest("token-twice"))))
+                .containsEntry("permissions", List.of("coupon:issue"));
+    }
+
+    /**
+     * An ACL that cannot be read fails closed without logging anyone out: 200, the session kept
+     * and slid, and no grants at all, not even the row's, which may be the one taken away.
+     */
+    @Test
+    void checkSession_aclThatThrows_keepsTheSessionButGrantsNothing() {
+        seedLive("token-down", List.of("merchant"), List.of("coupon:issue"));
+
+        ResponseEntity<?> response = liveController((npub, pubkey) -> {
+            throw new IllegalStateException("acl store down");
+        }).checkSession(sessionRequest("token-down"));
+
+        assertThat(response.getStatusCode().value()).isEqualTo(200);
+        assertThat(body(response)).containsEntry("roles", List.of());
+        assertThat(body(response)).containsEntry("permissions", List.of());
+        SessionRecord after = sessionStore.getBySessionId("sid-token-down").orElseThrow();
+        assertThat(after.revokedAt()).isNull();
+        assertThat(after.lastActivityAt()).isGreaterThan(Instant.now().getEpochSecond() - 5);
+    }
+
+    /** An Error from the resolver (e.g. a missing class) fails closed too, never a 500. */
+    @Test
+    void checkSession_aclThatThrowsAnError_keepsTheSessionButGrantsNothing() {
+        seedLive("token-err", List.of("merchant"), List.of("coupon:issue"));
+
+        ResponseEntity<?> response = liveController((npub, pubkey) -> {
+            throw new NoClassDefFoundError("acl/Missing");
+        }).checkSession(sessionRequest("token-err"));
+
+        assertThat(response.getStatusCode().value()).isEqualTo(200);
+        assertThat(body(response)).containsEntry("roles", List.of());
+        assertThat(body(response)).containsEntry("permissions", List.of());
+        assertThat(sessionStore.getBySessionId("sid-token-err").orElseThrow().revokedAt()).isNull();
+    }
+
+    /** "Denied" from a resolver that could not read the ACL is the same transient case. */
+    @Test
+    void checkSession_uncertainDenial_keepsTheSessionButGrantsNothing() {
+        seedLive("token-lag", List.of("merchant"), List.of("coupon:issue"));
+
+        ResponseEntity<?> response = liveController((npub, pubkey) -> AclDecision.denied("replica_lag"))
+                .checkSession(sessionRequest("token-lag"));
+
+        assertThat(response.getStatusCode().value()).isEqualTo(200);
+        assertThat(body(response)).containsEntry("permissions", List.of());
+        assertThat(sessionStore.getBySessionId("sid-token-lag").orElseThrow().revokedAt()).isNull();
+    }
+
+    /** A suspension is not a session with no permissions. It ends every session the key holds. */
+    @Test
+    void checkSession_certainDenial_endsEveryOneOfThePrincipalsSessions() {
+        seedLive("token-sus-1", List.of("merchant"), List.of("coupon:issue"));
+        seedLive("token-sus-2", List.of("merchant"), List.of("coupon:issue"));
+
+        ResponseEntity<?> response = liveController((npub, pubkey) -> AclDecision.denied("suspended", true))
+                .checkSession(sessionRequest("token-sus-1"));
+
+        assertThat(response.getStatusCode().value()).isEqualTo(401);
+        assertThat(body(response)).containsEntry("reason", "invalid");
+        // Revoked rows are no longer returned: both sessions are gone, not just the one asked about.
+        assertThat(sessionStore.getBySessionId("sid-token-sus-1")).isEmpty();
+        assertThat(sessionStore.getBySessionId("sid-token-sus-2")).isEmpty();
+    }
+
+    /** The resolver is asked about the session's principal, not anyone else. */
+    @Test
+    void checkSession_resolvesTheSessionsOwnPrincipal() {
+        seedLive("token-who", List.of(), List.of());
+        var asked = new java.util.ArrayList<String>();
+
+        liveController((npub, pubkey) -> {
+            asked.add(npub + "|" + pubkey);
+            return AclDecision.allowed(List.of(), List.of());
+        }).checkSession(sessionRequest("token-who"));
+
+        assertThat(asked).containsExactly("npub-live|" + LIVE_PUBKEY);
+    }
+
+    /** No session, no ACL read: an anonymous probe must not cost a resolver call. */
+    @Test
+    void checkSession_unknownCookie_neverReachesTheResolver() {
+        var calls = new java.util.concurrent.atomic.AtomicInteger();
+
+        ResponseEntity<?> response = liveController((npub, pubkey) -> {
+            calls.incrementAndGet();
+            return AclDecision.allowed(List.of(), List.of());
+        }).checkSession(sessionRequest("nobody"));
+
+        assertThat(response.getStatusCode().value()).isEqualTo(401);
+        assertThat(calls).hasValue(0);
     }
 
     // -----------------------------------------------------------------
