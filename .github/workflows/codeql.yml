@@ -35,7 +35,7 @@ jobs:
         language: ['java-kotlin']
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Autobuild runs Maven, which needs a JDK matching the one the project
       # targets. Without this the analysis builds against whatever the runner
