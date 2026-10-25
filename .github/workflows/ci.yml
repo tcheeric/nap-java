@@ -276,7 +276,7 @@ jobs:
       # split as the supported approach.
       - name: Restore the NVD database
         id: nvd-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: ~/.m2/repository/org/owasp/dependency-check-data
           key: nvd-${{ runner.os }}-${{ github.run_id }}
@@ -380,7 +380,7 @@ jobs:
 
       - name: Save the NVD database
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: ~/.m2/repository/org/owasp/dependency-check-data
           key: nvd-${{ runner.os }}-${{ github.run_id }}
