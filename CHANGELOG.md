@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Bump nostr-java from 2.3.1 to 2.4.4 through a local dependencyManagement override declared before the imani-bom import; imani-bom stays where it is until this repo moves to imani-bom >= 0.2.29.
+
 ## [0.9.1] - 2026-10-09
 
 Patch: one fix, no API removed. The new 8-argument `NapAuthController` constructor is

@@ -27,6 +27,8 @@
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
 
         <imani-bom.version>0.1.81</imani-bom.version>
+        <!-- Local override until this repo moves to imani-bom >= 0.2.29, which manages nostr-java 2.4.4. -->
+        <nostr-java.version>2.4.4</nostr-java.version>
 
         <!-- Security overrides of versions imani-bom resolves transitively. Each is the
              lowest release that carries the fix, so the override is a patch bump rather
@@ -47,6 +49,18 @@
 
     <dependencyManagement>
         <dependencies>
+            <!-- Local override until this repo moves to imani-bom >= 0.2.29, which manages nostr-java 2.4.4.
+                 Declared before the imani-bom import so these entries win. -->
+            <dependency>
+                <groupId>xyz.tcheeric</groupId>
+                <artifactId>nostr-java-core</artifactId>
+                <version>${nostr-java.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>xyz.tcheeric</groupId>
+                <artifactId>nostr-java-event</artifactId>
+                <version>${nostr-java.version}</version>
+            </dependency>
             <dependency>
                 <groupId>xyz.tcheeric</groupId>
                 <artifactId>imani-bom</artifactId>
